@@ -301,7 +301,7 @@ def plot_topomap_grid_for_band(band: str, results, metric: str, out_dir: Path):
             mask = rej.astype(bool)
             info = make_info(inter, sfreq=250.0)
             im, _ = mne.viz.plot_topomap(
-                vec, info, cmap="RdBu_r", vlim=vlim,
+                vec, info, cmap=config.CMAP_TOPO, vlim=vlim,
                 contours=0, sensors=True, axes=ax, show=False,
                 mask=mask, mask_params=dict(marker="o", markersize=5, alpha=0.0),
             )

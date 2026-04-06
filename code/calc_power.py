@@ -24,6 +24,9 @@ PSD_FMAX  = config.PSD_FMAX
 
 EXPORT_REL  = config.EXPORT_RELATIVE
 STD_DUR_SEC = config.STANDARDIZE_DURATION_SEC  # seconds or None
+ABS_SCALE   = float(getattr(config, "POWER_ABS_SCALE", 1.0))
+if not np.isfinite(ABS_SCALE) or ABS_SCALE <= 0:
+    ABS_SCALE = 1.0
 
 GROUP_ACTIVE  = set(config.GROUP_ACTIVE)
 GROUP_PASSIVE = set(config.GROUP_PASSIVE)
@@ -38,6 +41,7 @@ VS_ORDER    = getattr(config, "VS_ORDER", ["EO", "EC"])
 print("\n=== calc_power.py (BIDS-aware) ===")
 print(f"Reading from : {PROCESSED_DIR}")
 print(f"Saving to    : {POWER_DIR}")
+print(f"ABS scale    : x{ABS_SCALE:g}")
 
 # ---- helpers -----------------------------------------------------------------
 _BIDS_CONCAT_RE = re.compile(
@@ -236,6 +240,7 @@ for item in pairs:
             for band in BANDS_ORDER:
                 br = BANDS[band]
                 p_abs = _roi_band_abs(psds, freqs, picks, br)
+                p_abs_scaled = float(p_abs * ABS_SCALE) if np.isfinite(p_abs) else np.nan
                 p_rel = (
                     float(p_abs / rel_den)
                     if (EXPORT_REL and np.isfinite(rel_den) and rel_den > 0 and np.isfinite(p_abs))
@@ -250,7 +255,7 @@ for item in pairs:
                         "visual_state": state,
                         "region": region,
                         "band": band,
-                        "power_abs": float(p_abs) if np.isfinite(p_abs) else np.nan,
+                        "power_abs": p_abs_scaled,
                         "power_rel": p_rel,
                         "duration_s": dur_s,
                         "base_file": f"{base}",

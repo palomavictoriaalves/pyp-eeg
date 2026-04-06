@@ -84,8 +84,17 @@ def _wilcoxon_p(a, b):
     except Exception:
         return np.nan
 
-def choose_test(a, b, p_shapiro, alpha=ALPHA):
+def choose_test(a, b, p_shapiro, alpha=ALPHA, force_test=None):
     a = np.asarray(a, float); b = np.asarray(b, float)
+    if force_test == "t_paired":
+        try:
+            _, pval = stats.ttest_rel(a, b, nan_policy="omit")
+            return "t_paired", float(pval)
+        except Exception:
+            return "t_paired", np.nan
+    if force_test == "wilcoxon":
+        return "wilcoxon", _wilcoxon_p(a, b)
+
     if np.isnan(p_shapiro):
         return "wilcoxon", _wilcoxon_p(a, b)
     if p_shapiro >= alpha:
@@ -141,7 +150,7 @@ def longify(df, bands=None, regions=None):
     long["band"] = rb[1]
     return long
 
-def paired_summary(df_block, pair_col, level_A, level_B):
+def paired_arrays(df_block, pair_col, level_A, level_B):
     piv = df_block.pivot_table(index="subject", columns=pair_col, values="value", aggfunc="mean")
     if level_A not in piv.columns or level_B not in piv.columns:
         return None
@@ -150,16 +159,53 @@ def paired_summary(df_block, pair_col, level_A, level_B):
         return None
     A = sub[level_A].values
     B = sub[level_B].values
+    return A, B, len(sub)
+
+def paired_summary(df_block, pair_col, level_A, level_B, force_test=None):
+    paired = paired_arrays(df_block, pair_col, level_A, level_B)
+    if paired is None:
+        return None
+    A, B, n = paired
     mean_A = float(np.mean(A)) if A.size else np.nan
     mean_B = float(np.mean(B)) if B.size else np.nan
     delta = float(mean_A - mean_B) if np.isfinite(mean_A) and np.isfinite(mean_B) else np.nan
     p_norm = shapiro_p(A - B)
-    test_used, p_val = choose_test(A, B, p_norm, alpha=ALPHA)
+    test_used, p_val = choose_test(A, B, p_norm, alpha=ALPHA, force_test=force_test)
     dz = cohen_dz(A, B)
     return dict(mean_A=mean_A, mean_B=mean_B, delta=delta,
                 normality_test="Shapiro-Wilk", normality_p=p_norm,
                 test_used=test_used, p_value=p_val,
-                sig=p_to_stars(p_val), d=dz, n=len(sub))
+                sig=p_to_stars(p_val), d=dz, n=n)
+
+def pick_global_test_mode(long: pd.DataFrame, alpha: float = ALPHA) -> str:
+    """Choose one global test family for the full analysis table.
+
+    If any paired comparison violates normality, or if normality is undefined,
+    Wilcoxon is used for all rows. Otherwise, a paired t-test is used
+    throughout the table.
+    """
+    pvals = []
+
+    for _, d in long.groupby(["group", "session", "region", "band"], dropna=False):
+        paired = paired_arrays(d, pair_col="visual_state", level_A="EC", level_B="EO")
+        if paired is None:
+            continue
+        A, B, _ = paired
+        pvals.append(shapiro_p(A - B))
+
+    for _, d in long.groupby(["group", "visual_state", "region", "band"], dropna=False):
+        paired = paired_arrays(d, pair_col="session", level_A="POST", level_B="PRE")
+        if paired is None:
+            continue
+        A, B, _ = paired
+        pvals.append(shapiro_p(A - B))
+
+    if not pvals:
+        return "wilcoxon"
+
+    pvals = np.asarray(pvals, float)
+    has_non_normal = np.any(~np.isfinite(pvals)) or np.any(pvals < alpha)
+    return "wilcoxon" if has_non_normal else "t_paired"
 
 # ---- Runner ----
 def run_for_table(path_csv: Path, tag: str):
@@ -172,13 +218,19 @@ def run_for_table(path_csv: Path, tag: str):
     if long is None:
         print(f"[{tag}] no ROI__Band columns found in {path_csv.name}.")
         return
+    global_test_mode = pick_global_test_mode(long, alpha=ALPHA)
+    print(f"[{tag}] global test mode: {global_test_mode}")
+
     out_dir = OUT_ROOT / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # EC vs EO
     rows = []
     for (g, sess, reg, band), d in long.groupby(["group", "session", "region", "band"], dropna=False):
-        res = paired_summary(d, pair_col="visual_state", level_A="EC", level_B="EO")
+        res = paired_summary(
+            d, pair_col="visual_state", level_A="EC", level_B="EO",
+            force_test=global_test_mode,
+        )
         if res is None:
             continue
         base = res["mean_B"]
@@ -201,7 +253,10 @@ def run_for_table(path_csv: Path, tag: str):
     # POST vs PRE
     rows = []
     for (g, state, reg, band), d in long.groupby(["group", "visual_state", "region", "band"], dropna=False):
-        res = paired_summary(d, pair_col="session", level_A="POST", level_B="PRE")
+        res = paired_summary(
+            d, pair_col="session", level_A="POST", level_B="PRE",
+            force_test=global_test_mode,
+        )
         if res is None:
             continue
         base = res["mean_B"]

@@ -36,6 +36,7 @@ PSD_FMAX      = 50.0   # Hz
 # === Power export =============================================================
 EXPORT_RELATIVE          = True
 STANDARDIZE_DURATION_SEC = None  # e.g. 120.0
+POWER_ABS_SCALE          = 1e12  # scale PSD from V^2/Hz to uV^2/Hz by default
 
 # === Study design =============================================================
 GROUP_ACTIVE  = {'01', '05', '07', '10', '15', '16', '19'}
@@ -61,11 +62,11 @@ ACTIVE_CHANNELS = {
 
 # === Bands & ROIs =============================================================
 BANDS = {
-    "Delta": (0.1, 3.5),
-    "Theta": (4.0, 7.9),
+    #"Delta": (0.1, 3.5),
+    #"Theta": (4.0, 7.9),
     "Alpha": (8.0, 12.9),
-    "Beta":  (13.0, 30.0),
-    "Gamma": (30.1, 50.0),
+    #"Beta":  (13.0, 30.0),
+    #"Gamma": (30.1, 50.0),
 }
 
 REGIONS = {
@@ -90,8 +91,17 @@ GROUPS_ORDER = GROUPS
 SESS_ORDER   = SESSIONS
 VS_ORDER     = VISUAL_STATES
 
-PALETTE_SESS = {"PRE": "#72B2E7", "POST": "#003366"}
-PALETTE_VS   = {"EO": "#7FB3D5", "EC": "#1F618D"}
+PALETTE_SESS  = {"PRE": "#72B2E7", "POST": "#F28E2B"}
+PALETTE_VS    = {"EO": "#7FB3D5", "EC": "#1F618D"}
+PALETTE_GROUP = {"Active": "#E07B39", "Passive": "#4878CF", "Control": "#6ACC65"}
+
+COLOR_FDR = "#27AE60"   # significance markers in timeseries plots
+
+# Colormaps — change here to propagate across all plots
+CMAP_POWER     = "viridis"   # timeseries power heatmaps
+CMAP_NETWORK   = "viridis"   # MDM network node coloring (df_hat)
+CMAP_ADJACENCY = "YlGnBu"    # MDM adjacency heatmaps (edge frequency)
+CMAP_TOPO      = "RdBu_r"    # topomaps (diverging, POST-PRE delta)
 
 # === Time-series ==============================================================
 TS_WIN_SEC        = 4.0
@@ -99,12 +109,46 @@ TS_STEP_SEC       = 1.0
 TS_FDR_ALPHA      = 0.05
 TS_MARK_SIG       = True
 TS_GENERATE_PLOTS = True
+TS4_GENERATE_CONTINUOUS_PLOTS = True
+TS4_GENERATE_EO_COMBINED_PLOTS = True
 
-TS_USE_FIRST_BLOCK_ONLY = True
-
-
+# X-axis windows in seconds.
+# State-level outputs use keys "EO"/"EC" via `results/timeseries/ts_power_long.csv`.
+# `plot_timeseries.py` reconstructs block-level conditions
+# ("EO_1", "EC_1", "EO_2", "EC_2") from the concatenated file annotations and
+# places each block on its original recording-time axis.
 TS_FIXED_X_WINDOWS = {
-    "EO": (15.0, 55.0),
-    "EC": (150.0, 190.0),
+    "EO":   (0.0, 240.0),    # concatenated EO file time (EO1 + EO2), starting at 0 s
+    "EC":   (0.0, 240.0),    # concatenated EC file time (EC1 + EC2), starting at 0 s
+    "EO_1": (15.0, 135.0),   # first EO block in original recording time
+    "EC_1": (150.0, 270.0),  # first EC block in original recording time
+    "EO_2": (285.0, 405.0),  # second EO block in original recording time
+    "EC_2": (420.0, 540.0),  # second EC block in original recording time
 }
+
 ROI_CHANNELS = REGIONS
+# === MDMP =====================================================================
+MDMP_ENABLED = True
+
+# Run one or both metrics in a single call to code/calc_mdmp.py
+MDMP_METRICS_TO_RUN = ("power_rel", "power_abs")
+
+# Legacy fallback used only when MDMP_METRICS_TO_RUN is empty
+MDMP_METRIC = "power_abs"
+
+MDMP_INPUT_CSV = TS_DIR / "ts_power_long.csv"
+MDMP_OUTPUT_DIR = RESULTS_DIR / "mdmp"
+MDMP_OUTPUT_DIR_REL = RESULTS_DIR / "mdmp_rel"
+MDMP_OUTPUT_DIR_ABS = RESULTS_DIR / "mdmp_abs"
+
+MDMP_GROUP_COLS = ("subject", "session", "visual_state", "band")
+MDMP_NODE_COL = "region"
+MDMP_TIME_COL = ""   # empty = auto-detect from input
+
+MDMP_METHOD = "hc"
+MDMP_MIN_T = 20
+MDMP_MIN_NODES = 3
+MDMP_NBF = 15
+MDMP_DELTA_GRID = ()
+MDMP_MAX_RUNS = None
+MDMP_IGNORE_ENABLED_FLAG = False

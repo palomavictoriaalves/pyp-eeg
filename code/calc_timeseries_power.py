@@ -25,15 +25,17 @@ VS_ORDER = config.VS_ORDER
 PSD_FMIN = config.PSD_FMIN
 PSD_FMAX = config.PSD_FMAX
 WELCH_SEG_SEC = config.WELCH_SEG_SEC
+WELCH_OVERLAP = config.WELCH_OVERLAP
 TS_WIN_SEC = config.TS_WIN_SEC
 TS_STEP_SEC = config.TS_STEP_SEC
+ABS_SCALE = float(getattr(config, "POWER_ABS_SCALE", 1.0))
+if not np.isfinite(ABS_SCALE) or ABS_SCALE <= 0:
+    ABS_SCALE = 1.0
 
 GROUP_ACTIVE = set(config.GROUP_ACTIVE)
 GROUP_PASSIVE = set(config.GROUP_PASSIVE)
 GROUP_CONTROL = set(config.GROUP_CONTROL)
 ACTIVE_CHANNELS = set(config.ACTIVE_CHANNELS)
-
-USE_FIRST_BLOCK = getattr(config, "TS_USE_FIRST_BLOCK_ONLY", False)
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -86,10 +88,7 @@ def load_state_raw(f: Path):
 # ---------------------------------------------------------------------
 # Discover candidate FIF files
 # ---------------------------------------------------------------------
-if USE_FIRST_BLOCK:
-    concat_files = sorted(PROCESSED_DIR.rglob("*_block1_raw.fif"))
-else:
-    concat_files = sorted(PROCESSED_DIR.rglob("*_clean_raw.fif"))
+concat_files = sorted(PROCESSED_DIR.rglob("*_clean_raw.fif"))
 
 bases = []
 seen = set()
@@ -148,14 +147,17 @@ for entry in bases:
         print(f"Not enough windows for {f.stem}; skipping.")
         continue
 
-    n_per_seg = max(16, int(round(float(TS_WIN_SEC) * sf)))
+    epoch_n_samples = len(epochs.times)
+    n_per_seg = min(epoch_n_samples, max(16, int(round(float(WELCH_SEG_SEC) * sf))))
+    n_overlap = int(round(float(WELCH_OVERLAP) * n_per_seg))
+    n_overlap = min(max(n_overlap, 0), max(n_per_seg - 1, 0))
     spec = epochs.compute_psd(
         method="welch",
         fmin=float(PSD_FMIN),
         fmax=fmax_eff,
         n_fft=n_per_seg,
         n_per_seg=n_per_seg,
-        n_overlap=int(round((float(TS_WIN_SEC) - float(TS_STEP_SEC)) * sf)),
+        n_overlap=n_overlap,
         verbose="ERROR",
     )
     psds, freqs = spec.get_data(return_freqs=True)
@@ -163,13 +165,16 @@ for entry in bases:
     total_mask = (freqs >= float(PSD_FMIN)) & (freqs <= fmax_eff)
     band_masks = {b: ((freqs >= lo) & (freqs <= hi)) for b, (lo, hi) in BANDS.items()}
 
-    starts = epochs.events[:, 0] / sf
+    # MNE preserves absolute sample indices via `first_samp`; normalize them so
+    # exported times always start at 0 within each EO/EC derivative file.
+    starts = (epochs.events[:, 0] - float(raw.first_samp)) / sf
     centers = starts + float(TS_WIN_SEC) / 2.0
 
     for roi in ROIS_ORDER:
         chs = REGIONS[roi]
         picks = pick_roi_channel_indices(raw, chs)
         if picks.size == 0:
+            print(f"  WARNING: ROI '{roi}' has no matching channels in {f.stem}; skipping.")
             continue
 
         total = psds[:, picks][:, :, total_mask].mean(axis=2)
@@ -192,7 +197,7 @@ for entry in bases:
                     "region": roi,
                     "band": band,
                     "t_sec": float(t),
-                    "power_abs": float(p_abs) if np.isfinite(p_abs) else np.nan,
+                    "power_abs": float(p_abs * ABS_SCALE) if np.isfinite(p_abs) else np.nan,
                     "power_rel": float(p_rel) if np.isfinite(p_rel) else np.nan,
                     "source_file": f.stem,
                 })
@@ -214,6 +219,8 @@ params = dict(
     PSD_FMIN=float(PSD_FMIN),
     PSD_FMAX=float(PSD_FMAX),
     WELCH_SEG_SEC=float(WELCH_SEG_SEC),
+    WELCH_OVERLAP=float(WELCH_OVERLAP),
+    POWER_ABS_SCALE=float(ABS_SCALE),
 )
 (OUT_DIR / "readme_params.json").write_text(json.dumps(params, indent=2), encoding="utf-8")
 

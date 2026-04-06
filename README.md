@@ -1,4 +1,4 @@
-# PYPELINE-EEG
+# Pyp-EEG
 
 A complete pipeline to **preprocess**, **quantify**, and **visualize** EEG power in studies with **customizable** sessions and experimental conditions.
 Inputs follow BIDS; outputs are publication-ready CSVs and figures.
@@ -15,21 +15,27 @@ Inputs follow BIDS; outputs are publication-ready CSVs and figures.
 │  ├─ preprocess.py                         # BIDS-aware preprocessing for BrainVision
 │  ├─ calc_power.py                         # builds wide power tables (ABS/REL)
 │  ├─ calc_timeseries_power.py              # time-series data assembly
-│  ├─ plot_timeseries_all_EC_EO.py          # visualization: time-series per band × ROI
-│  ├─ plot_topomaps_grid_EO_EC.py           # visualization: topographic grids
-│  ├─ plot_heat_all_bands_timeseries.py     # visualization: heatmaps of temporal power by band
-│  ├─ plot_mirror_EO_EC_points.py           # visualization: mirror/bar/point plots
+│  ├─ plot_timeseries.py                    # visualization: block-resolved time-series plots
+│  ├─ plot_topomaps_grid.py                 # visualization: topographic grids
+│  ├─ plot_mirror.py                        # visualization: mirror/bar/point plots
 │  ├─ calc_stats_power.py                   # minimal paired stats from wide power tables
+│  ├─ calc_mdmp.py                          # MDMP dynamic directed network inference
+│  ├─ plot_mdmp_heatmaps.py                 # MDMP adjacency heatmaps
+│  ├─ plot_mdmp_networks.py                 # MDMP network plots (individual + group)
 │  └─ config.py                             # parameters and paths
 ├─ data/                                    # BIDS input
 │  └─ sub-XX[/ses-YY]/eeg/*.vhdr + .eeg + .vmrk (+ .json)
 ├─ results/                                 # derivatives (generated)
-│  ├─ processed/                            # preprocessed FIFs (concat, EO, EC + manifest)
-│  ├─ power/                                # wide power tables (abs/rel)
+│  ├─ processed/                            # preprocessed FIFs (concat, EO, EC, block1/block2 + manifest)
+│  ├─ power/                                # power tables and ROI coverage
 │  ├─ timeseries/                           # per-ROI×band temporal data
-│  └─ plots/                                # figures and CSVs
+│  ├─ stats/                                # paired within-design stats
+│  ├─ mdmp_rel/                             # MDMP outputs for relative power
+│  ├─ mdmp_abs/                             # MDMP outputs for absolute power
+│  └─ plots/                                # figures and plot-side CSVs
 ├─ assets/
 │  └─ steps.png
+├─ run.py                                   # one-command pipeline orchestrator
 ├─ requirements.txt
 └─ LICENSE.txt
 ```
@@ -74,6 +80,28 @@ data/
 ```
 
 > Each `.vhdr` **must** correctly reference its `.eeg`/`.vmrk`. 
+
+---
+
+## Dataset Used in This Project
+
+This pipeline was developed and tested using the OpenNeuro dataset
+[`ds006801`](https://doi.org/10.18112/openneuro.ds006801.v1.0.0).
+
+- **OpenNeuro accession number**: `ds006801`
+- **Dataset DOI**: [10.18112/openneuro.ds006801.v1.0.0](https://doi.org/10.18112/openneuro.ds006801.v1.0.0)
+- **Modality**: EEG
+- **Task**: `rest`
+- **Sessions**: 2
+- **Participants**: 21
+- **License**: CC0
+- **Dataset authors**: Paloma Victoria de Sales Alves, Antonio Simeão Sobrinho Neto, and Carla Alexandra da Silva Moita Minervino
+- **Funding**: Coordination for the Improvement of Higher Education Personnel (CAPES) and the Federal University of Paraíba (UFPB)
+- **Ethics approval**: CCS/UFPB Research Ethics Committee (CAAE `84958824.1.0000.5188`, approval `7.400.264`)
+
+Recommended dataset citation:
+
+> Paloma Victoria de Sales Alves, Antonio Simeão Sobrinho Neto, and Carla Alexandra da Silva Moita Minervino (2025). Resting-state EEG before and after different study methods. OpenNeuro. Dataset. doi:10.18112/openneuro.ds006801.v1.0.0
 
 ---
 
@@ -128,6 +156,8 @@ Other key settings you will likely edit:
       "Gamma": (30.1, 50.0),
   }
   ```
+  In the current analysis, only `Alpha` is enabled by default in `config.py`.
+  Users can enable or disable bands by commenting or uncommenting entries in `BANDS`.
 
 - **Groups & ordering**
   ```python
@@ -162,19 +192,78 @@ Other key settings you will likely edit:
   TS_MARK_SIG       = True
   TS_GENERATE_PLOTS = True
 
-    # process only the first block (EO/EC) if True
-  TS_USE_FIRST_BLOCK_ONLY = True
-
-  # fixed X-windows per visual state (seconds, relative to block)
+  # fixed X-windows in seconds
   TS_FIXED_X_WINDOWS = {
-      "EO": (15.0, 55.0),
-      "EC": (150.0, 190.0),
+      "EO":   (0.0, 240.0),
+      "EC":   (0.0, 240.0),
+      "EO_1": (15.0, 135.0),
+      "EC_1": (150.0, 270.0),
+      "EO_2": (285.0, 405.0),
+      "EC_2": (420.0, 540.0),
   }
   ```
+  `EO` and `EC` refer to the concatenated state-level files (`*_EO_clean_raw.fif`,
+  `*_EC_clean_raw.fif`) with time starting at `0 s`. `EO_1`, `EC_1`, `EO_2`, and
+  `EC_2` are block-level windows in original recording time, used by `plot_timeseries.py`.
 
 ---
 
 ## Quick start (from project root)
+
+### Run the full pipeline
+
+To execute the full workflow with one command:
+
+```bash
+python3 run.py
+```
+
+Useful variants:
+
+```bash
+# run only the core analytical steps
+python3 run.py --core-only
+
+# keep core + MDMP, but skip topomaps and mirror plots
+python3 run.py --skip-optional-plots
+
+# keep core + optional plots, but skip MDMP products
+python3 run.py --no-mdmp
+
+# inspect available step keys
+python3 run.py --list-steps
+
+# preview commands without executing anything
+python3 run.py --dry-run
+
+# start from a specific step
+python3 run.py --from-step timeseries_csv
+
+# stop after a specific step
+python3 run.py --to-step stats
+
+# run only selected steps, in canonical order
+python3 run.py --only mdmp,mdmp_networks,mdmp_heatmaps
+
+# skip selected steps
+python3 run.py --skip topomaps,mirror
+
+# continue even if a step fails
+python3 run.py --continue-on-error
+```
+
+What each variant does:
+
+- `--core-only`: runs only `preprocess`, `power`, `timeseries_csv`, `timeseries`, and `stats`.
+- `--skip-optional-plots`: removes `topomaps` and `mirror`, but keeps MDMP if it is otherwise enabled.
+- `--no-mdmp`: removes `mdmp`, `mdmp_networks`, and `mdmp_heatmaps`.
+- `--from-step <key>`: starts at the selected step and runs forward.
+- `--to-step <key>`: stops after the selected step.
+- `--only a,b,c`: runs only the listed step keys while preserving the pipeline's canonical order.
+- `--skip a,b,c`: excludes only the listed step keys.
+- `--continue-on-error`: continues with later steps instead of stopping on the first failure.
+- `--dry-run`: prints the exact commands without executing them.
+- `--list-steps`: prints all available step keys and exits.
 
 1) **Preprocess** all `.vhdr` (BIDS-aware):
 ```bash
@@ -188,24 +277,37 @@ python code/calc_power.py
 Expected outputs:
 ```
 results/power/
+  power_long_by_region_EO_EC.xlsx
   power_wide_rel_EO_EC.csv
   power_wide_abs_EO_EC.csv
+  roi_coverage_EO_EC.csv
 ```
 
-3) **EO/EC time series** (band × ROI; 2×3 PRE/POST × group panels):
+3) **Time-series CSV for sliding-window analyses and MDMP:**
 ```bash
-python code/plot_timeseries_all_EC_EO.py
+python code/calc_timeseries_power.py
 ```
 Outputs:
 ```
-results/plots/timeseries_all/
-├─ csv/
-│  └─ timeseries_all_bands_rois_relabs.csv
-└─ figs/
-   └─ timeseries_<Band>_<metric>_<ROI>.png
+results/timeseries/
+  ts_power_long.csv
+  readme_params.json
 ```
 
-4) **Minimal paired stats** (EC vs EO, POST vs PRE) from wide tables:
+4) **Block-resolved time-series plots** (EO_1 / EC_1 / EO_2 / EC_2):
+```bash
+python code/plot_timeseries.py
+```
+Outputs:
+```
+results/plots/timeseries/
+├─ csv/
+│  └─ ts_all_bands_rois_relabs.csv
+└─ figs/
+   └─ ts_<Band>_<metric>_<ROI>.png
+```
+
+5) **Minimal paired stats** (EC vs EO, POST vs PRE) from wide tables:
 ```bash
 python code/calc_stats_power.py
 ```
@@ -220,11 +322,17 @@ results/stats/
    └─ stats_abs_POSTvsPRE.csv
 ```
 
-**Optional plots:**
+6) **Optional plots and MDMP derivatives:**
 ```bash
-python code/plot_topomaps_grid_EO_EC.py
-python code/plot_heat_all_bands_timeseries.py
-python code/plot_mirror_EO_EC_points.py
+python code/plot_topomaps_grid.py
+python code/plot_mirror.py
+
+# MDMP inference from `results/timeseries/ts_power_long.csv`
+python code/calc_mdmp.py
+
+# MDMP heatmaps and network plots (run after `calc_mdmp.py`)
+python code/plot_mdmp_heatmaps.py --input-dirs results/mdmp_rel,results/mdmp_abs
+python code/plot_mdmp_networks.py --input-dirs results/mdmp_rel,results/mdmp_abs
 ```
 
 ---
@@ -239,7 +347,9 @@ python code/plot_mirror_EO_EC_points.py
 - `*_desc-preproc_EO_clean_raw.fif`
 - `*_desc-preproc_EC_clean_raw.fif`
 - `*_desc-preproc_EO_block1_raw.fif` (first EO block, post-ICA)
+- `*_desc-preproc_EO_block2_raw.fif` (second EO block, post-ICA)
 - `*_desc-preproc_EC_block1_raw.fif` (first EC block, post-ICA)
+- `*_desc-preproc_EC_block2_raw.fif` (second EC block, post-ICA)
 - `*_desc-preproc_blocks_manifest.csv`  
 **Key steps:** `standard_1020` montage, band-pass `[FILTER_LOW, FILTER_HIGH]`, notch `NOTCH_HZ`, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax, `random_state=97`), automatic IC rejection with **ICLabel**, `visual_state:*` annotations.
 
@@ -257,13 +367,11 @@ python code/plot_mirror_EO_EC_points.py
 
 ### `code/calc_timeseries_power.py`
 **Purpose:** Extract sliding-window power time series (ABS/REL) per **Band × ROI**.  
-**Inputs:** Preprocessed FIFs in `results/processed/**/eeg/`. Respects:
-- `TS_USE_FIRST_BLOCK_ONLY=True` → uses `*_block1_raw.fif`
-- otherwise → uses `*_clean_raw.fif`  
+**Inputs:** Preprocessed FIFs (`*_clean_raw.fif`) in `results/processed/**/eeg/`.
 **Outputs:** `results/timeseries/`
 - `ts_power_long.csv`
 - `readme_params.json` (parameters used)  
-**Notes:** windows `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch from `WELCH_SEG_SEC`; robust filename parser for subject/session/state.
+**Notes:** windows `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch from `WELCH_SEG_SEC` and `WELCH_OVERLAP`; `t_sec` is normalized to each file's local time origin; robust filename parser for subject/session/state.
 
 ### `code/calc_stats_power.py`
 **Purpose:** Minimal paired stats from wide power tables.  
@@ -271,33 +379,45 @@ python code/plot_mirror_EO_EC_points.py
 **Outputs:** `results/stats/{abs,rel}/`
 - `stats_*_EOvsEC.csv`
 - `stats_*_POSTvsPRE.csv`  
-**Key steps:** Shapiro–Wilk on differences → paired `ttest_rel` or `wilcoxon`; reports means, Δ, p-values, significance stars, **Cohen’s d_z**, and `n`. Adds `delta_pct` with the correct baseline (EO for EC−EO; PRE for POST−PRE). Optional output precision via `PRECISION_MODE` (`none|fixed|auto`).
+**Key steps:** Computes Shapiro–Wilk on paired differences and enforces one global test family per table (conservative rule): if any panel violates normality (or is undefined), all rows use `wilcoxon`; otherwise all rows use paired `ttest_rel`. Reports means, Δ, p-values, significance stars, **Cohen’s d_z**, and `n`. Adds `delta_pct` with the correct baseline (EO for EC−EO; PRE for POST−PRE). Optional output precision via `PRECISION_MODE` (`none|fixed|auto`).
+
+### `code/calc_mdmp.py`
+**Purpose:** Learn directed MDMP networks from ROI time series (`ts_power_long.csv`).  
+**Inputs:** `results/timeseries/ts_power_long.csv`.  
+**Outputs:** `results/mdmp*/`
+- `mdmp_runs_summary.csv`
+- `mdmp_edges_long.csv`
+- `mdmp_delta_by_node.csv`
+- `mdmp_skipped_runs.csv`  
+**Notes:** by default, runs metrics listed in `config.MDMP_METRICS_TO_RUN` and writes to `config.MDMP_OUTPUT_DIR_REL` / `config.MDMP_OUTPUT_DIR_ABS`. You can still force a single metric with `--metric` or `--metrics`.
+
+### `code/plot_mdmp_networks.py`
+**Purpose:** Plot directed MDMP graphs for **individual runs** and **group-level summaries**.  
+**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv` and `mdmp_delta_by_node.csv`.  
+**Outputs:** `results/plots/mdmp_networks/`
+- `individual/<metric>/<band>/mdmp_sub-<...>.png`
+- `group/<metric>/<band>/mdmp_group-<...>.png`  
+**Notes:** node color = `df_hat`; individual edges are presence/absence; group edges are weighted by edge frequency across subjects.
 
 ---
 
-### `code/plot_timeseries_all_EC_EO.py`
-**Purpose:** 2×3 panels (**rows: EO/EC; columns: groups**) plotting **PRE** and **POST** mean ± 95% CI over time.  
-**Inputs:** `results/processed/**/eeg/*.fif` (uses `*_block1_raw.fif` if `TS_USE_FIRST_BLOCK_ONLY=True`, else `*_clean_raw.fif`).  
-**Outputs:** `results/plots/timeseries_all/`
-- `csv/timeseries_all_bands_rois_relabs.csv`
-- `figs/timeseries_<Band>_<metric>_<ROI>.png`  
-**Notes:** fixed X-windows per visual state via `TS_FIXED_X_WINDOWS`; PSD sliding windows; aggregation by `ROI_CHANNELS`; optional BH-FDR timepoint marking (`TS_FDR_ALPHA`).
+### `code/plot_timeseries.py`
+**Purpose:** Block-resolved time-series analysis for `EO_1`, `EC_1`, `EO_2`, and `EC_2`, with optional continuous and EO-combined views.  
+**Inputs:** `results/processed/**/eeg/*_desc-preproc_clean_raw.fif`.  
+**Outputs:** `results/plots/timeseries/`
+- `csv/ts_all_bands_rois_relabs.csv`
+- `figs/ts_<Band>_<metric>_<ROI>.png`
+- `figs/ts_continuous_<Band>_<metric>_<ROI>.png` (optional)
+- `figs/ts_eo_combined_<Band>_<metric>_<ROI>.png` (optional)  
+**Notes:** reconstructs block-level conditions from `visual_state:*` annotations, restores original recording-time coordinates, and applies optional BH-FDR timepoint marking (`TS_FDR_ALPHA`).
 
-### `code/plot_topomaps_grid_EO_EC.py`
+### `code/plot_topomaps_grid.py`
 **Purpose:** 2×3 topographic grids (EO/EC × groups) of **POST − PRE** per band.  
 **Inputs:** Preprocessed FIFs.  
 **Outputs:** `results/plots/topomaps_grid_{rel,abs}/topogrid_{relDiff|absDiff}_<Band>.png`  
 **Notes:** per-channel one-sample t vs. 0 with **FDR q=.05**; REL shown as **Δ%**, ABS as **Δ dB**; shared color limits per figure.
 
-### `code/plot_heat_all_bands_timeseries.py`
-**Purpose:** Time × participant heatmaps (rows: EO/EC × PRE/POST; columns: groups).  
-**Inputs:** `results/timeseries/ts_power_long.csv`.  
-**Outputs:** `results/plots/timeseries_heatmaps_prepost/`
-- `heat_PREPOST_<Band>_<ROI>_{REL|ABS}_<order>.png`
-- `summary_<Band>_<ROI>_{REL|ABS}.csv` (mean & AUC per subject; outlier flag)  
-**Notes:** color scale options (panel/band/global); subject ordering configurable; AUC via `scipy.integrate.trapezoid`.
-
-### `code/plot_mirror_EO_EC_points.py`
+### `code/plot_mirror.py`
 **Purpose:** Mirror/bar/point plots for **Band × ROI**.  
 **Inputs:** `results/power/power_long_by_region_EO_EC.xlsx`.  
 **Outputs:**  
@@ -305,12 +425,18 @@ python code/plot_mirror_EO_EC_points.py
 - `results/plots/mirror_by_region_abs/mirror_<Band>_<ROI>.png`  
 **Notes:** PRE on left / POST on right; error bars = 95% CI (fallback: SE); outliers flagged when |z| ≥ 2; scientific notation on X-axis; per-panel X-limits (band+region).
 
+### `code/plot_mdmp_heatmaps.py`
+**Purpose:** Heatmaps of MDMP adjacency matrices by group and condition.  
+**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv`.  
+**Outputs:** `results/plots/mdmp_heatmaps/mdmp_heat_<Band>_<REL|ABS>.png`  
+**Notes:** auto-detects MDMP directories if `--input-dirs` is omitted; plots one 4×3 panel per band/metric using canonical group and condition ordering.
+
 
 ---
 
 ## Units & definitions
 
-- **Absolute power (ABS)**: band-averaged PSD in **V²/Hz**. Consider scaling to **µV²/Hz** for readability.
+- **Absolute power (ABS)**: band-averaged PSD in **µV²/Hz** (`POWER_ABS_SCALE` in `config.py`, default `1e12`).
 - **Relative power (REL)**: band / total power over `[PSD_FMIN, min(PSD_FMAX, Nyquist−1 Hz)]`.
 - **Time-series**: windows of `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch parameters from `WELCH_SEG_SEC` and `WELCH_OVERLAP`.
 
@@ -325,6 +451,16 @@ python code/plot_mirror_EO_EC_points.py
 
 ---
 
+## Acknowledgments
+
+This pipeline uses the `mdmp` ecosystem for dynamic network modeling in EEG analyses.
+
+- **Original MDM/`mdmr` work**: [Lilia Costa](mailto:liliacosta@ufba.br)
+- **`mdmr` R package maintainer**: [Arthur R. Azevedo](mailto:arthur.rios@ufba.br)
+- **Python `mdmp` implementation used by this pipeline**: [Matheus Augusto Oliveira dos Santos](mailto:matheusaugusto@ufba.br)
+
+---
+
 ## License
 
 Licensed under **Creative Commons Attribution 4.0 International (CC BY 4.0)**.  
@@ -332,6 +468,6 @@ See [`LICENSE.txt`](LICENSE.txt).
 
 ---
 
-**Questions or issues?** [Open an issue](https://github.com/palomavictoriaalves/pypeline-eeg/issues/new)
+**Questions or issues?** [Open an issue](https://github.com/palomavictoriaalves/Pyp-EEG/issues/new)
  with the command you ran, your data layout (BIDS path), and the full error traceback.
 If you prefer, you can also contact the maintainer by email: [palomavictoria14@gmail.com](mailto:palomavictoria14@gmail.com)

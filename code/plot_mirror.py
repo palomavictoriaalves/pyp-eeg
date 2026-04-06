@@ -41,7 +41,24 @@ OUTLIER_Z = 2.0
 POINT_EDGE = "#000000"
 
 # --- load ---------------------------------------------------------------------
-df = pd.read_excel(DATA_PATH)
+if DATA_PATH.exists():
+    df = pd.read_excel(DATA_PATH)
+else:
+    ts_csv = config.TS_DIR / "ts_power_long.csv"
+    if not ts_csv.exists():
+        raise FileNotFoundError(
+            f"Neither {DATA_PATH} nor {ts_csv} found. "
+            "Run calc_timeseries_power.py first."
+        )
+    print(f"[mirror] {DATA_PATH.name} not found — aggregating from {ts_csv.name}")
+    _raw = pd.read_csv(ts_csv)
+    df = (
+        _raw.groupby(
+            ["subject", "group", "session", "visual_state", "region", "band"],
+            as_index=False,
+        )
+        .agg(power_abs=("power_abs", "mean"), power_rel=("power_rel", "mean"))
+    )
 
 need_base = {"subject", "group", "session", "visual_state", "region", "band"}
 need_measures = {"power_rel", "power_abs"}

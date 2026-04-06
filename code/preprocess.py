@@ -137,6 +137,8 @@ def out_paths_for(vhdr_path: Path, desc: str = "preproc"):
         "ec":       outdir / f"{base}_desc-{desc}_EC_clean_raw.fif",
         "eo_block1": outdir / f"{base}_desc-{desc}_EO_block1_raw.fif",
         "ec_block1": outdir / f"{base}_desc-{desc}_EC_block1_raw.fif",
+        "eo_block2": outdir / f"{base}_desc-{desc}_EO_block2_raw.fif",
+        "ec_block2": outdir / f"{base}_desc-{desc}_EC_block2_raw.fif",
         "manifest": outdir / f"{base}_desc-{desc}_blocks_manifest.csv",
     }
 
@@ -249,11 +251,21 @@ for vhdr_path in files:
             if exclude_idx: ica.apply(first)
             first.save(str(opaths["eo_block1"]), overwrite=True)
             print(f"  Saved first EO block: {opaths['eo_block1']}")
+        if len(eo_blocks) >= 2:
+            second = eo_blocks[1].copy()
+            if exclude_idx: ica.apply(second)
+            second.save(str(opaths["eo_block2"]), overwrite=True)
+            print(f"  Saved second EO block: {opaths['eo_block2']}")
         if ec_blocks:
             first = ec_blocks[0].copy()
             if exclude_idx: ica.apply(first)
             first.save(str(opaths["ec_block1"]), overwrite=True)
             print(f"  Saved first EC block: {opaths['ec_block1']}")
+        if len(ec_blocks) >= 2:
+            second = ec_blocks[1].copy()
+            if exclude_idx: ica.apply(second)
+            second.save(str(opaths["ec_block2"]), overwrite=True)
+            print(f"  Saved second EC block: {opaths['ec_block2']}")
 
         _save_blocks_manifest(opaths["manifest"], manifest)
 
