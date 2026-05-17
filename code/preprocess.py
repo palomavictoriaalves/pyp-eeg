@@ -243,7 +243,7 @@ for vhdr_path in files:
             raw_EC.save(str(opaths["ec"]), overwrite=True)
             print(f"  Saved EC: {opaths['ec']}")
 
-        # NEW: save first block EO/EC (after ICA)
+        # Save first EO/EC block after ICA for block-resolved analyses.
         eo_blocks = [seg for state, seg in blocks if state == "EO"]
         ec_blocks = [seg for state, seg in blocks if state == "EC"]
         if eo_blocks:

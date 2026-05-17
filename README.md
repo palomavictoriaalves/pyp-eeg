@@ -20,8 +20,8 @@ Inputs follow BIDS; outputs are publication-ready CSVs and figures.
 │  ├─ plot_mirror.py                        # visualization: mirror/bar/point plots
 │  ├─ calc_stats_power.py                   # minimal paired stats from wide power tables
 │  ├─ calc_mdmp.py                          # MDMP dynamic directed network inference
-│  ├─ plot_mdmp_heatmaps.py                 # MDMP adjacency heatmaps
-│  ├─ plot_mdmp_networks.py                 # MDMP network plots (individual + group)
+│  ├─ plot_mdmp_networks.py                 # MDMP network plots from calc_mdmp CSVs
+│  ├─ plot_mdmp_heatmaps.py                 # MDMP static heatmaps + optional GIF/frame panels
 │  └─ config.py                             # parameters and paths
 ├─ data/                                    # BIDS input
 │  └─ sub-XX[/ses-YY]/eeg/*.vhdr + .eeg + .vmrk (+ .json)
@@ -30,8 +30,7 @@ Inputs follow BIDS; outputs are publication-ready CSVs and figures.
 │  ├─ power/                                # power tables and ROI coverage
 │  ├─ timeseries/                           # per-ROI×band temporal data
 │  ├─ stats/                                # paired within-design stats
-│  ├─ mdmp_rel/                             # MDMP outputs for relative power
-│  ├─ mdmp_abs/                             # MDMP outputs for absolute power
+│  ├─ mdmp/                                 # group median and individual MDMP outputs
 │  └─ plots/                                # figures and plot-side CSVs
 ├─ assets/
 │  └─ steps.png
@@ -79,7 +78,7 @@ data/
 └─ sub-02/ ...
 ```
 
-> Each `.vhdr` **must** correctly reference its `.eeg`/`.vmrk`. 
+> Each `.vhdr` **must** correctly reference its `.eeg`/`.vmrk`.
 
 ---
 
@@ -331,8 +330,8 @@ python code/plot_mirror.py
 python code/calc_mdmp.py
 
 # MDMP heatmaps and network plots (run after `calc_mdmp.py`)
-python code/plot_mdmp_heatmaps.py --input-dirs results/mdmp_rel,results/mdmp_abs
-python code/plot_mdmp_networks.py --input-dirs results/mdmp_rel,results/mdmp_abs
+python code/plot_mdmp_heatmaps.py --input-dirs results/mdmp
+python code/plot_mdmp_networks.py --input-dirs results/mdmp
 ```
 
 ---
@@ -340,8 +339,8 @@ python code/plot_mdmp_networks.py --input-dirs results/mdmp_rel,results/mdmp_abs
 ## Detailed script descriptions
 
 ### `code/preprocess.py`
-**Purpose:** BIDS-aware EEG preprocessing (BrainVision) and derivatives generation.  
-**Inputs:** `data/**/eeg/*.vhdr` (+ `.eeg`, `.vmrk`).  
+**Purpose:** BIDS-aware EEG preprocessing (BrainVision) and derivatives generation.
+**Inputs:** `data/**/eeg/*.vhdr` (+ `.eeg`, `.vmrk`).
 **Outputs:** `results/processed/**/eeg/`
 - `*_desc-preproc_clean_raw.fif` (concatenated)
 - `*_desc-preproc_EO_clean_raw.fif`
@@ -350,86 +349,98 @@ python code/plot_mdmp_networks.py --input-dirs results/mdmp_rel,results/mdmp_abs
 - `*_desc-preproc_EO_block2_raw.fif` (second EO block, post-ICA)
 - `*_desc-preproc_EC_block1_raw.fif` (first EC block, post-ICA)
 - `*_desc-preproc_EC_block2_raw.fif` (second EC block, post-ICA)
-- `*_desc-preproc_blocks_manifest.csv`  
+- `*_desc-preproc_blocks_manifest.csv`
 **Key steps:** `standard_1020` montage, band-pass `[FILTER_LOW, FILTER_HIGH]`, notch `NOTCH_HZ`, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax, `random_state=97`), automatic IC rejection with **ICLabel**, `visual_state:*` annotations.
 
 ---
 
 ### `code/calc_power.py`
-**Purpose:** Compute **absolute (ABS)** and **relative (REL)** power per **Band × ROI** (EO/EC, PRE/POST).  
-**Inputs:** `results/processed/**/eeg/*_desc-preproc_(clean_raw|EO|EC)_clean_raw.fif`, `*_blocks_manifest.csv`.  
+**Purpose:** Compute **absolute (ABS)** and **relative (REL)** power per **Band × ROI** (EO/EC, PRE/POST).
+**Inputs:** `results/processed/**/eeg/*_desc-preproc_(clean_raw|EO|EC)_clean_raw.fif`, `*_blocks_manifest.csv`.
 **Outputs:** `results/power/`
 - `power_long_by_region_EO_EC.xlsx`
 - `power_wide_abs_EO_EC.csv`
 - `power_wide_rel_EO_EC.csv`
-- `roi_coverage_EO_EC.csv`  
+- `roi_coverage_EO_EC.csv`
 **Notes:** REL = band / total over [`PSD_FMIN`, `PSD_FMAX`]; deterministic ordering controlled by `config` lists.
 
 ### `code/calc_timeseries_power.py`
-**Purpose:** Extract sliding-window power time series (ABS/REL) per **Band × ROI**.  
+**Purpose:** Extract sliding-window power time series (ABS/REL) per **Band × ROI**.
 **Inputs:** Preprocessed FIFs (`*_clean_raw.fif`) in `results/processed/**/eeg/`.
 **Outputs:** `results/timeseries/`
 - `ts_power_long.csv`
-- `readme_params.json` (parameters used)  
+- `readme_params.json` (parameters used)
 **Notes:** windows `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch from `WELCH_SEG_SEC` and `WELCH_OVERLAP`; `t_sec` is normalized to each file's local time origin; robust filename parser for subject/session/state.
 
 ### `code/calc_stats_power.py`
-**Purpose:** Minimal paired stats from wide power tables.  
-**Inputs:** `results/power/power_wide_{abs,rel}_EO_EC.csv`.  
+**Purpose:** Minimal paired stats from wide power tables.
+**Inputs:** `results/power/power_wide_{abs,rel}_EO_EC.csv`.
 **Outputs:** `results/stats/{abs,rel}/`
 - `stats_*_EOvsEC.csv`
-- `stats_*_POSTvsPRE.csv`  
+- `stats_*_POSTvsPRE.csv`
 **Key steps:** Computes Shapiro–Wilk on paired differences and enforces one global test family per table (conservative rule): if any panel violates normality (or is undefined), all rows use `wilcoxon`; otherwise all rows use paired `ttest_rel`. Reports means, Δ, p-values, significance stars, **Cohen’s d_z**, and `n`. Adds `delta_pct` with the correct baseline (EO for EC−EO; PRE for POST−PRE). Optional output precision via `PRECISION_MODE` (`none|fixed|auto`).
 
 ### `code/calc_mdmp.py`
-**Purpose:** Learn directed MDMP networks from ROI time series (`ts_power_long.csv`).  
-**Inputs:** `results/timeseries/ts_power_long.csv`.  
-**Outputs:** `results/mdmp*/`
+**Purpose:** Build group-level median VTS and individual-subject MDMP networks from ROI time series (`ts_power_long.csv`).
+**Inputs:** `results/timeseries/ts_power_long.csv`.
+**Outputs:** group median VTS tables in `results/mdmp/groups/<metric>/` and individual-subject tables in `results/mdmp/individual/<metric>/`.
+
+Each output directory contains:
 - `mdmp_runs_summary.csv`
 - `mdmp_edges_long.csv`
 - `mdmp_delta_by_node.csv`
-- `mdmp_skipped_runs.csv`  
-**Notes:** by default, runs metrics listed in `config.MDMP_METRICS_TO_RUN` and writes to `config.MDMP_OUTPUT_DIR_REL` / `config.MDMP_OUTPUT_DIR_ABS`. You can still force a single metric with `--metric` or `--metrics`.
+- `mdmp_skipped_runs.csv`
+
+Median output directories also include:
+- `mdmp_vts_metadata.csv`
+
+**Notes:** by default, runs metrics listed in `config.MDMP_METRICS_TO_RUN`. For each metric it writes the median/group model under `config.MDMP_OUTPUT_DIR/groups/<metric>` (`results/mdmp/groups/power_rel`, `results/mdmp/groups/power_abs`) and the individual models under `config.MDMP_OUTPUT_DIR/individual/<metric>`. The median model groups by `config.MDMP_GLOBAL_GROUP_COLS`, aligns subject time series, computes `compute_vts(method="median")`, fits `MDM(...)`, and exports the final edge/node tables. Edge tables include `median_coef` and `abs_median_coef`, computed from the smoothed dynamic coefficient of each learned parent -> child connection.
 
 ### `code/plot_mdmp_networks.py`
-**Purpose:** Plot directed MDMP graphs for **individual runs** and **group-level summaries**.  
-**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv` and `mdmp_delta_by_node.csv`.  
-**Outputs:** `results/plots/mdmp_networks/`
-- `individual/<metric>/<band>/mdmp_sub-<...>.png`
-- `group/<metric>/<band>/mdmp_group-<...>.png`  
-**Notes:** node color = `df_hat`; individual edges are presence/absence; group edges are weighted by edge frequency across subjects.
+**Purpose:** Plot directed MDMP graphs from already computed MDMP CSVs.
+**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv` and `mdmp_delta_by_node.csv`; `results/mdmp` is auto-expanded recursively to median and individual metric subdirectories.
+**Outputs:** `results/plots/mdmp_networks/groups/<metric>/<band>/mdmp_median_<...>.png` for median VTS outputs, and `results/plots/mdmp_networks/individual/<metric>/<band>/mdmp_sub-<...>.png` when individual-run CSVs are provided.
+**Notes:** node color = `df_hat`; edges use normalized `abs_median_coef`. This script no longer recalculates median VTS networks; `code/calc_mdmp.py` owns that computation.
 
 ---
 
 ### `code/plot_timeseries.py`
-**Purpose:** Block-resolved time-series analysis for `EO_1`, `EC_1`, `EO_2`, and `EC_2`, with optional continuous and EO-combined views.  
-**Inputs:** `results/processed/**/eeg/*_desc-preproc_clean_raw.fif`.  
+**Purpose:** Block-resolved time-series analysis for `EO_1`, `EC_1`, `EO_2`, and `EC_2`, with optional continuous and EO-combined views.
+**Inputs:** `results/processed/**/eeg/*_desc-preproc_clean_raw.fif`.
 **Outputs:** `results/plots/timeseries/`
 - `csv/ts_all_bands_rois_relabs.csv`
 - `figs/ts_<Band>_<metric>_<ROI>.png`
 - `figs/ts_continuous_<Band>_<metric>_<ROI>.png` (optional)
-- `figs/ts_eo_combined_<Band>_<metric>_<ROI>.png` (optional)  
+- `figs/ts_eo_combined_<Band>_<metric>_<ROI>.png` (optional)
 **Notes:** reconstructs block-level conditions from `visual_state:*` annotations, restores original recording-time coordinates, and applies optional BH-FDR timepoint marking (`TS_FDR_ALPHA`).
 
 ### `code/plot_topomaps_grid.py`
-**Purpose:** 2×3 topographic grids (EO/EC × groups) of **POST − PRE** per band.  
-**Inputs:** Preprocessed FIFs.  
-**Outputs:** `results/plots/topomaps_grid_{rel,abs}/topogrid_{relDiff|absDiff}_<Band>.png`  
+**Purpose:** 2×3 topographic grids (EO/EC × groups) of **POST − PRE** per band.
+**Inputs:** Preprocessed FIFs.
+**Outputs:** `results/plots/topomaps_grid_{rel,abs}/topogrid_{relDiff|absDiff}_<Band>.png`
 **Notes:** per-channel one-sample t vs. 0 with **FDR q=.05**; REL shown as **Δ%**, ABS as **Δ dB**; shared color limits per figure.
 
 ### `code/plot_mirror.py`
-**Purpose:** Mirror/bar/point plots for **Band × ROI**.  
-**Inputs:** `results/power/power_long_by_region_EO_EC.xlsx`.  
-**Outputs:**  
+**Purpose:** Mirror/bar/point plots for **Band × ROI**.
+**Inputs:** `results/power/power_long_by_region_EO_EC.xlsx`.
+**Outputs:**
 - `results/plots/mirror_by_region_rel/mirror_<Band>_<ROI>.png`
-- `results/plots/mirror_by_region_abs/mirror_<Band>_<ROI>.png`  
+- `results/plots/mirror_by_region_abs/mirror_<Band>_<ROI>.png`
 **Notes:** PRE on left / POST on right; error bars = 95% CI (fallback: SE); outliers flagged when |z| ≥ 2; scientific notation on X-axis; per-panel X-limits (band+region).
 
 ### `code/plot_mdmp_heatmaps.py`
-**Purpose:** Heatmaps of MDMP adjacency matrices by group and condition.  
-**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv`.  
-**Outputs:** `results/plots/mdmp_heatmaps/mdmp_heat_<Band>_<REL|ABS>.png`  
-**Notes:** auto-detects MDMP directories if `--input-dirs` is omitted; plots one 4×3 panel per band/metric using canonical group and condition ordering.
+**Purpose:** MDMP adjacency heatmaps plus optional dynamic heatmap GIFs and static frame panels.
+**Inputs:** one or more MDMP output directories containing `mdmp_edges_long.csv`, plus `results/timeseries/ts_power_long.csv` when dynamic GIFs/frames are enabled.
+**Outputs:** `results/plots/mdmp_heatmaps/groups/<metric>/<band>/mdmp_heat_median_<...>.png` for median VTS outputs, `results/plots/mdmp_heatmaps/individual/<metric>/<band>/mdmp_heat_sub-<...>.png` when individual-run CSVs are provided, and, when enabled, `results/plots/mdmp_heatmaps/dynamic/<metric>/{gifs,frames}/<band>/...`.
+**Notes:** configure dynamic outputs in `config.py`: `MDMP_HEATMAP_DYNAMIC_ENABLED` controls both GIFs and frame panels together; `MDMP_HEATMAP_FRAME_COUNT` and `MDMP_HEATMAP_FRAME_RANGE` control the frame panel (inclusive, e.g. `(0, 9)` renders seconds 0 through 9).
+
+Static frame panels summarize selected dynamic coefficient matrices in a single PNG, while GIFs animate the same MDMP dynamics across time.
+
+![MDMP dynamic frame panel](assets/frame_example.png)
+
+---
+
+![MDMP dynamic heatmap GIF](assets/gif_example.gif)
 
 
 ---
@@ -463,7 +474,7 @@ This pipeline uses the `mdmp` ecosystem for dynamic network modeling in EEG anal
 
 ## License
 
-Licensed under **Creative Commons Attribution 4.0 International (CC BY 4.0)**.  
+Licensed under **Creative Commons Attribution 4.0 International (CC BY 4.0)**.
 See [`LICENSE.txt`](LICENSE.txt).
 
 ---

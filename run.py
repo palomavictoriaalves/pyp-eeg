@@ -40,13 +40,14 @@ def static_step(key: str, label: str, group: str, script_relpath: str, *extra_ar
 
 def detect_mdmp_input_dirs(root: Path) -> list[Path]:
     """Return MDMP output directories that contain the expected CSVs."""
-    candidates = [
-        root / "results" / "mdmp_rel",
-        root / "results" / "mdmp_abs",
-        root / "results" / "mdmp",
-    ]
+    base = root / "results" / "mdmp"
     found: list[Path] = []
     seen: set[Path] = set()
+
+    if not base.exists():
+        return found
+
+    candidates = [base, *sorted(path for path in base.rglob("*") if path.is_dir())]
     for directory in candidates:
         resolved = directory.resolve()
         if resolved in seen:
@@ -80,22 +81,26 @@ def mdmp_network_step() -> Step:
     )
 
 
+
 def mdmp_heatmaps_step() -> Step:
     def _argv(root: Path, python_exe: str) -> Optional[list[str]]:
         input_dirs = detect_mdmp_input_dirs(root)
-        if not input_dirs:
+        input_csv = root / "results" / "timeseries" / "ts_power_long.csv"
+        if not input_dirs and not input_csv.exists():
             return None
-        csv_dirs = ",".join(str(path) for path in input_dirs)
-        return [
+        argv = [
             python_exe,
             str((root / "code" / "plot_mdmp_heatmaps.py").resolve()),
-            "--input-dirs",
-            csv_dirs,
         ]
+        if input_dirs:
+            argv.extend(["--input-dirs", ",".join(str(path) for path in input_dirs)])
+        if input_csv.exists():
+            argv.extend(["--input-csv", str(input_csv.resolve())])
+        return argv
 
     return Step(
         key="mdmp_heatmaps",
-        label="Generate MDMP adjacency heatmaps",
+        label="Generate MDMP static/dynamic heatmaps",
         group="mdmp",
         argv_factory=_argv,
     )

@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib-cache"))
+os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "xdg-cache"))
 
 import numpy as np
 import pandas as pd
 
 try:
-    from mdmp import MDM
+    from mdmp import MDM, compute_vts
 except Exception as exc:
     MDM = None
+    compute_vts = None
     MDM_IMPORT_ERROR = exc
 else:
     MDM_IMPORT_ERROR = None
@@ -22,6 +28,7 @@ import config
 
 
 DEFAULT_GROUP_COLS = ("subject", "session", "visual_state", "band")
+DEFAULT_GLOBAL_GROUP_COLS = ("group", "session", "visual_state", "band")
 DEFAULT_NODE_COL = "region"
 TIME_CANDIDATES = ("t_sec", "time_s")
 VALID_METRICS = ("power_rel", "power_abs")
@@ -74,6 +81,37 @@ def parse_delta_grid(raw_grid: str, fallback: Sequence[float]) -> Optional[np.nd
 def normalize_reason(error: Exception, max_len: int = 250) -> str:
     text = str(error).strip() or error.__class__.__name__
     return text[:max_len]
+
+
+def extract_edge_medians(model: Any, node_names: Sequence[str]) -> Dict[Tuple[str, str], float]:
+    """Return median smoothed coefficient for each learned parent -> child edge."""
+    medians: Dict[Tuple[str, str], float] = {}
+    smoothed = getattr(model, "Smoo", {}) or {}
+    filtered = getattr(model, "Filt", {}) or {}
+    smt = smoothed.get("smt", {}) if isinstance(smoothed, dict) else {}
+    row_names = filtered.get("row_names", {}) if isinstance(filtered, dict) else {}
+
+    for child_idx, child_name in enumerate(node_names):
+        values = smt.get(child_idx)
+        names = row_names.get(child_idx, [])
+        if values is None or not names:
+            continue
+
+        values = np.asarray(values, dtype=float)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+
+        for param_idx, param_name in enumerate(names):
+            if param_idx >= values.shape[0] or "->" not in str(param_name):
+                continue
+            parent, child = str(param_name).split("->", 1)
+            if child != str(child_name):
+                child = str(child_name)
+            series = values[param_idx, :]
+            finite = series[np.isfinite(series)]
+            medians[(parent, child)] = float(np.median(finite)) if finite.size else np.nan
+
+    return medians
 
 
 def resolve_time_col(df: pd.DataFrame, explicit_time_col: str) -> str:
@@ -135,6 +173,54 @@ def prepare_run_matrix(
 
 def context_to_text(context: Dict[str, Any], group_cols: Sequence[str]) -> str:
     return ", ".join(f"{col}={context.get(col)}" for col in group_cols)
+
+
+def normalize_subject(value: object) -> str:
+    if pd.isna(value):
+        return "NA"
+    text = str(value).strip()
+    if text.lower().startswith("sub-"):
+        text = text[4:]
+    if text.endswith(".0"):
+        text = text[:-2]
+    if text.isdigit():
+        return text.zfill(2)
+    return text or "NA"
+
+
+def normalize_group(value: object) -> str:
+    if pd.isna(value):
+        return "Unknown"
+    text = str(value).strip()
+    if not text:
+        return "Unknown"
+    upper = text.upper()
+    if upper.startswith("ACT"):
+        return "Active"
+    if upper.startswith("PAS"):
+        return "Passive"
+    if upper.startswith("CON"):
+        return "Control"
+    return text
+
+
+def node_order_for_wides(wides: Sequence[pd.DataFrame], node_order: Sequence[str]) -> List[str]:
+    common = set(wides[0].columns)
+    for wide in wides[1:]:
+        common &= set(wide.columns)
+    ordered = [node for node in node_order if node in common]
+    ordered.extend(sorted(common.difference(ordered)))
+    return ordered
+
+
+def unique_columns(columns: Sequence[str]) -> List[str]:
+    seen = set()
+    out = []
+    for col in columns:
+        if col not in seen:
+            out.append(col)
+            seen.add(col)
+    return out
 
 
 def run(
@@ -249,6 +335,7 @@ def run(
                 nbf=int(nbf),
                 delta=delta,
                 verbose=False,
+                show_progress=False,
             )
         except Exception as exc:
             summary["status"] = "failed"
@@ -273,15 +360,21 @@ def run(
             continue
 
         edges = np.argwhere(adj == 1)
+        edge_medians = extract_edge_medians(model, node_names)
         for parent_idx, child_idx in edges:
+            parent_name = node_names[int(parent_idx)]
+            child_name = node_names[int(child_idx)]
+            median_coef = edge_medians.get((parent_name, child_name), np.nan)
             edges_rows.append(
                 {
                     **context,
                     "metric": metric_col,
                     "method": method,
-                    "parent": node_names[int(parent_idx)],
-                    "child": node_names[int(child_idx)],
+                    "parent": parent_name,
+                    "child": child_name,
                     "edge": 1,
+                    "median_coef": median_coef,
+                    "abs_median_coef": abs(median_coef) if np.isfinite(median_coef) else np.nan,
                 }
             )
 
@@ -323,7 +416,16 @@ def run(
         "status",
         "reason",
     ]
-    edges_cols = group_cols_list + ["group", "metric", "method", "parent", "child", "edge"]
+    edges_cols = group_cols_list + [
+        "group",
+        "metric",
+        "method",
+        "parent",
+        "child",
+        "edge",
+        "median_coef",
+        "abs_median_coef",
+    ]
     delta_cols = group_cols_list + ["group", "metric", "method", "node", "df_hat"]
 
     summary_df = pd.DataFrame(runs_summary, columns=summary_cols)
@@ -354,12 +456,386 @@ def run(
     return 0
 
 
+def fit_global_median_context(
+    context: Dict[str, Any],
+    block: pd.DataFrame,
+    metric_col: str,
+    time_col: str,
+    node_col: str,
+    method: str,
+    min_t: int,
+    min_nodes: int,
+    min_subjects: int,
+    nbf: int,
+    delta: Optional[np.ndarray],
+    align_method: str,
+) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], List[str]]:
+    summary: Dict[str, Any] = {
+        **context,
+        "metric": metric_col,
+        "method": method,
+        "vts_method": "median",
+        "align_method": align_method,
+        "time_col": time_col,
+        "n_rows_in": int(len(block)),
+        "n_subjects_available": 0,
+        "n_subjects_used": 0,
+        "n_subjects_skipped": 0,
+        "n_timepoints": 0,
+        "n_nodes_ready": 0,
+        "n_edges": 0,
+        "fit_seconds": np.nan,
+        "status": "",
+        "reason": "",
+    }
+    edges_rows: List[Dict[str, Any]] = []
+    delta_rows: List[Dict[str, Any]] = []
+    vts_df: Optional[pd.DataFrame] = None
+
+    min_t_effective = max(int(min_t), int(nbf) + 1)
+    subject_wides: List[pd.DataFrame] = []
+    subject_ids: List[str] = []
+    skipped_subjects: List[str] = []
+
+    for subject, subject_df in block.groupby("subject", dropna=False, sort=True):
+        summary["n_subjects_available"] += 1
+        subject_id = normalize_subject(subject)
+        try:
+            wide, info = prepare_run_matrix(
+                run_df=subject_df,
+                time_col=time_col,
+                node_col=node_col,
+                metric_col=metric_col,
+            )
+        except Exception:
+            skipped_subjects.append(subject_id)
+            continue
+        if info["n_timepoints"] < min_t_effective or info["n_nodes_ready"] < int(min_nodes):
+            skipped_subjects.append(subject_id)
+            continue
+        subject_wides.append(wide)
+        subject_ids.append(subject_id)
+
+    summary["n_subjects_used"] = len(subject_wides)
+    summary["n_subjects_skipped"] = len(skipped_subjects)
+
+    if len(subject_wides) < int(min_subjects):
+        summary["status"] = "skipped"
+        summary["reason"] = f"insufficient_subjects: {len(subject_wides)} < {int(min_subjects)}"
+        return summary, pd.DataFrame(), pd.DataFrame(), None, subject_ids
+
+    nodes = node_order_for_wides(subject_wides, getattr(config, "ROIS_ORDER", []))
+    if len(nodes) < int(min_nodes):
+        summary["status"] = "skipped"
+        summary["reason"] = f"insufficient_common_nodes: {len(nodes)} < {int(min_nodes)}"
+        return summary, pd.DataFrame(), pd.DataFrame(), None, subject_ids
+
+    aligned_inputs = [wide[nodes].copy() for wide in subject_wides]
+    try:
+        assert compute_vts is not None
+        vts_result = compute_vts(aligned_inputs, method="median", align_method=align_method)
+        vts_df = pd.DataFrame(np.asarray(vts_result.vts_data, dtype=float), columns=nodes)
+        vts_df = vts_df.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any")
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["reason"] = f"vts_error: {normalize_reason(exc)}"
+        return summary, pd.DataFrame(), pd.DataFrame(), None, subject_ids
+
+    summary["n_timepoints"] = int(vts_df.shape[0])
+    summary["n_nodes_ready"] = int(vts_df.shape[1])
+    if summary["n_timepoints"] < min_t_effective:
+        summary["status"] = "skipped"
+        summary["reason"] = f"insufficient_vts_timepoints: {summary['n_timepoints']} < {min_t_effective}"
+        return summary, pd.DataFrame(), pd.DataFrame(), vts_df, subject_ids
+
+    fit_start = time.perf_counter()
+    try:
+        assert MDM is not None
+        model = MDM(
+            vts_df,
+            method=method,
+            nbf=int(nbf),
+            delta=delta,
+            verbose=False,
+            show_progress=False,
+        )
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["reason"] = f"fit_error: {normalize_reason(exc)}"
+        summary["fit_seconds"] = round(time.perf_counter() - fit_start, 4)
+        return summary, pd.DataFrame(), pd.DataFrame(), vts_df, subject_ids
+
+    summary["fit_seconds"] = round(time.perf_counter() - fit_start, 4)
+    adj = np.asarray(model.adj_mat, dtype=int)
+    if adj.shape != (len(nodes), len(nodes)):
+        summary["status"] = "failed"
+        summary["reason"] = (
+            f"adjacency_shape_mismatch: got {adj.shape}, expected ({len(nodes)}, {len(nodes)})"
+        )
+        return summary, pd.DataFrame(), pd.DataFrame(), vts_df, subject_ids
+
+    edge_medians = extract_edge_medians(model, nodes)
+    for parent_idx, child_idx in np.argwhere(adj == 1):
+        parent = nodes[int(parent_idx)]
+        child = nodes[int(child_idx)]
+        median_coef = edge_medians.get((parent, child), np.nan)
+        edges_rows.append(
+            {
+                **context,
+                "metric": metric_col,
+                "method": method,
+                "vts_method": "median",
+                "align_method": align_method,
+                "n_subjects": len(subject_wides),
+                "subjects": ";".join(subject_ids),
+                "parent": parent,
+                "child": child,
+                "edge": 1,
+                "median_coef": median_coef,
+                "abs_median_coef": abs(median_coef) if np.isfinite(median_coef) else np.nan,
+            }
+        )
+
+    df_hat = np.asarray(model.DF.get("DF_hat", []), dtype=float).reshape(-1)
+    for idx, node_name in enumerate(nodes):
+        delta_rows.append(
+            {
+                **context,
+                "metric": metric_col,
+                "method": method,
+                "vts_method": "median",
+                "align_method": align_method,
+                "n_subjects": len(subject_wides),
+                "node": node_name,
+                "df_hat": float(df_hat[idx]) if idx < len(df_hat) else np.nan,
+            }
+        )
+
+    summary["status"] = "success"
+    summary["n_edges"] = len(edges_rows)
+    return summary, pd.DataFrame(edges_rows), pd.DataFrame(delta_rows), vts_df, subject_ids
+
+
+def run_global_median(
+    input_csv: Path,
+    output_dir: Path,
+    metric_col: str,
+    group_cols: Sequence[str],
+    node_col: str,
+    time_col: str,
+    method: str,
+    min_t: int,
+    min_nodes: int,
+    min_subjects: int,
+    nbf: int,
+    delta: Optional[np.ndarray],
+    align_method: str,
+    max_runs: Optional[int],
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not input_csv.exists():
+        raise FileNotFoundError(f"input CSV not found: {input_csv}")
+
+    df = pd.read_csv(input_csv)
+    if df.empty:
+        raise ValueError(f"input CSV is empty: {input_csv}")
+
+    required_cols = set(group_cols) | {"subject", node_col, metric_col, time_col}
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"missing required columns in input: {missing}")
+
+    summaries: List[Dict[str, Any]] = []
+    edges_frames: List[pd.DataFrame] = []
+    delta_frames: List[pd.DataFrame] = []
+    vts_meta_rows: List[Dict[str, Any]] = []
+
+    grouped = df.groupby(list(group_cols), dropna=False, sort=True)
+    total = int(grouped.ngroups)
+    min_t_effective = max(int(min_t), int(nbf) + 1)
+    print(
+        f"[mdmp] global median input rows={len(df)}, contexts={total}, metric={metric_col}, "
+        f"min_subjects={min_subjects}, min_t={min_t_effective}, min_nodes={min_nodes}"
+    )
+
+    for idx, (group_key, block) in enumerate(grouped, start=1):
+        if max_runs is not None and idx > max_runs:
+            break
+
+        key_tuple = group_key if isinstance(group_key, tuple) else (group_key,)
+        context = {col: value for col, value in zip(group_cols, key_tuple)}
+        if "group" in context:
+            context["group"] = normalize_group(context["group"])
+        if "session" in context:
+            context["session"] = str(context["session"]).upper()
+        if "visual_state" in context:
+            context["visual_state"] = str(context["visual_state"]).upper()
+
+        print(f"[mdmp] global run {idx}/{total}: {context_to_text(context, group_cols)}")
+        summary, edges_df, delta_df, vts_df, subject_ids = fit_global_median_context(
+            context=context,
+            block=block,
+            metric_col=metric_col,
+            time_col=time_col,
+            node_col=node_col,
+            method=method,
+            min_t=min_t,
+            min_nodes=min_nodes,
+            min_subjects=min_subjects,
+            nbf=nbf,
+            delta=delta,
+            align_method=align_method,
+        )
+        summaries.append(summary)
+        if not edges_df.empty:
+            edges_frames.append(edges_df)
+        if not delta_df.empty:
+            delta_frames.append(delta_df)
+        if vts_df is not None:
+            vts_meta_rows.append(
+                {
+                    **context,
+                    "metric": metric_col,
+                    "method": method,
+                    "vts_method": "median",
+                    "align_method": align_method,
+                    "n_subjects": len(subject_ids),
+                    "subjects": ";".join(subject_ids),
+                    "n_timepoints": int(vts_df.shape[0]),
+                    "n_nodes": int(vts_df.shape[1]),
+                    "nodes": ";".join(str(c) for c in vts_df.columns),
+                }
+            )
+
+        if summary["status"] == "success":
+            print(
+                f"  [ok] subjects={summary['n_subjects_used']} "
+                f"timepoints={summary['n_timepoints']} nodes={summary['n_nodes_ready']} "
+                f"edges={summary['n_edges']}"
+            )
+        else:
+            print(f"  [{summary['status']}] {summary['reason']}")
+
+    summary_cols = unique_columns(
+        [
+            *group_cols,
+            "metric",
+            "method",
+            "vts_method",
+            "align_method",
+            "time_col",
+            "n_rows_in",
+            "n_subjects_available",
+            "n_subjects_used",
+            "n_subjects_skipped",
+            "n_timepoints",
+            "n_nodes_ready",
+            "n_edges",
+            "fit_seconds",
+            "status",
+            "reason",
+        ]
+    )
+    edges_cols = unique_columns(
+        [
+            *group_cols,
+            "metric",
+            "method",
+            "vts_method",
+            "align_method",
+            "n_subjects",
+            "subjects",
+            "parent",
+            "child",
+            "edge",
+            "median_coef",
+            "abs_median_coef",
+        ]
+    )
+    delta_cols = unique_columns(
+        [
+            *group_cols,
+            "metric",
+            "method",
+            "vts_method",
+            "align_method",
+            "n_subjects",
+            "node",
+            "df_hat",
+        ]
+    )
+    vts_cols = unique_columns(
+        [
+            *group_cols,
+            "metric",
+            "method",
+            "vts_method",
+            "align_method",
+            "n_subjects",
+            "subjects",
+            "n_timepoints",
+            "n_nodes",
+            "nodes",
+        ]
+    )
+
+    summary_df = pd.DataFrame(summaries, columns=summary_cols)
+    edges_df = (
+        pd.concat(edges_frames, ignore_index=True)
+        if edges_frames
+        else pd.DataFrame(columns=edges_cols)
+    )
+    delta_df = (
+        pd.concat(delta_frames, ignore_index=True)
+        if delta_frames
+        else pd.DataFrame(columns=delta_cols)
+    )
+    vts_df = pd.DataFrame(vts_meta_rows, columns=vts_cols)
+    skipped_df = summary_df.loc[summary_df["status"] == "skipped"].copy()
+
+    out_summary = output_dir / "mdmp_runs_summary.csv"
+    out_edges = output_dir / "mdmp_edges_long.csv"
+    out_delta = output_dir / "mdmp_delta_by_node.csv"
+    out_skipped = output_dir / "mdmp_skipped_runs.csv"
+    out_vts = output_dir / "mdmp_vts_metadata.csv"
+
+    summary_df.to_csv(out_summary, index=False)
+    edges_df.to_csv(out_edges, index=False)
+    delta_df.to_csv(out_delta, index=False)
+    skipped_df.to_csv(out_skipped, index=False)
+    vts_df.to_csv(out_vts, index=False)
+
+    print(f"[mdmp] summary: {out_summary}")
+    print(f"[mdmp] edges:   {out_edges}")
+    print(f"[mdmp] deltas:  {out_delta}")
+    print(f"[mdmp] vts:     {out_vts}")
+    print(f"[mdmp] skipped: {out_skipped}")
+    print(
+        f"[mdmp] contexts={len(summary_df)}, "
+        f"success={(summary_df['status'] == 'success').sum() if not summary_df.empty else 0}, "
+        f"skipped={(summary_df['status'] == 'skipped').sum() if not summary_df.empty else 0}, "
+        f"failed={(summary_df['status'] == 'failed').sum() if not summary_df.empty else 0}"
+    )
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     group_cols_cfg = getattr(config, "MDMP_GROUP_COLS", DEFAULT_GROUP_COLS)
     if isinstance(group_cols_cfg, (list, tuple)):
         group_cols_default = ",".join(str(v).strip() for v in group_cols_cfg if str(v).strip())
     else:
         group_cols_default = str(group_cols_cfg).strip() or ",".join(DEFAULT_GROUP_COLS)
+
+    global_group_cols_cfg = getattr(config, "MDMP_GLOBAL_GROUP_COLS", DEFAULT_GLOBAL_GROUP_COLS)
+    if isinstance(global_group_cols_cfg, (list, tuple)):
+        global_group_cols_default = ",".join(
+            str(v).strip() for v in global_group_cols_cfg if str(v).strip()
+        )
+    else:
+        global_group_cols_default = (
+            str(global_group_cols_cfg).strip() or ",".join(DEFAULT_GLOBAL_GROUP_COLS)
+        )
 
     metrics_cfg = getattr(config, "MDMP_METRICS_TO_RUN", ())
     if isinstance(metrics_cfg, str):
@@ -385,25 +861,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=getattr(config, "MDMP_OUTPUT_DIR", config.RESULTS_DIR / "mdmp"),
-        help="Directory for MDMP outputs when running a single metric.",
-    )
-    parser.add_argument(
-        "--output-dir-rel",
-        type=Path,
-        default=getattr(config, "MDMP_OUTPUT_DIR_REL", config.RESULTS_DIR / "mdmp_rel"),
-        help="Output directory for metric=power_rel when running multiple metrics.",
-    )
-    parser.add_argument(
-        "--output-dir-abs",
-        type=Path,
-        default=getattr(config, "MDMP_OUTPUT_DIR_ABS", config.RESULTS_DIR / "mdmp_abs"),
-        help="Output directory for metric=power_abs when running multiple metrics.",
+        help="Base directory for MDMP outputs. Metrics are written under <output-dir>/<metric>/.",
     )
     parser.add_argument(
         "--group-cols",
         type=str,
         default=group_cols_default,
-        help="Comma-separated grouping columns (default: subject,session,visual_state,band).",
+        help="Legacy individual-run grouping columns.",
+    )
+    parser.add_argument(
+        "--global-group-cols",
+        type=str,
+        default=global_group_cols_default,
+        help="Comma-separated grouping columns for median VTS outputs.",
     )
     parser.add_argument(
         "--node-col",
@@ -470,6 +940,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional cap for number of grouped runs (debug/smoke test).",
     )
     parser.add_argument(
+        "--min-subjects",
+        type=int,
+        default=int(getattr(config, "MDMP_MIN_SUBJECTS", 2)),
+        help="Minimum subjects required for each median VTS context.",
+    )
+    parser.add_argument(
+        "--align-method",
+        choices=("truncate", "interpolate"),
+        default=getattr(config, "MDMP_ALIGN_METHOD", "truncate"),
+        help="Alignment method passed to mdmp.compute_vts.",
+    )
+    parser.add_argument(
         "--ignore-enabled-flag",
         action="store_true",
         default=bool(getattr(config, "MDMP_IGNORE_ENABLED_FLAG", False)),
@@ -481,11 +963,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_arg_parser().parse_args()
 
-    if MDM is None:
+    if MDM is None or compute_vts is None:
         raise ImportError(
-            "Could not import 'mdmp'. Install it with "
-            "'pip install mdmp' or "
-            "'pip install git+https://github.com/maods2/mdmp.git'."
+            "Could not import the local 'mdmp' API with MDM and compute_vts. "
+            "Install dependencies with 'pip install -r requirements.txt'."
         ) from MDM_IMPORT_ERROR
 
     if not getattr(config, "MDMP_ENABLED", True) and not args.ignore_enabled_flag:
@@ -493,20 +974,8 @@ def main() -> int:
         return 0
 
     group_cols = parse_csv_columns(args.group_cols)
+    global_group_cols = parse_csv_columns(args.global_group_cols)
     metrics = parse_metrics(raw_metrics=args.metrics, fallback_metric=args.metric)
-
-    if len(metrics) > 1:
-        output_by_metric = {
-            "power_rel": args.output_dir_rel.resolve(),
-            "power_abs": args.output_dir_abs.resolve(),
-        }
-        selected_paths = [output_by_metric[m] for m in metrics]
-        if len(set(selected_paths)) != len(selected_paths):
-            raise ValueError(
-                "output-dir-rel and output-dir-abs must be different when running multiple metrics."
-            )
-    else:
-        output_by_metric = {metrics[0]: args.output_dir.resolve()}
 
     delta = parse_delta_grid(
         raw_grid=args.delta_grid,
@@ -527,13 +996,33 @@ def main() -> int:
 
     preview_df = pd.read_csv(input_csv, nrows=5)
     time_col = resolve_time_col(preview_df, explicit_time_col=args.time_col)
+    output_base = args.output_dir.resolve()
 
     for metric in metrics:
-        metric_output = output_by_metric[metric]
-        print(f"[mdmp] metric={metric} -> output_dir={metric_output}")
-        run(
+        metric_output = output_base / "groups" / metric
+        print(f"[mdmp] metric={metric} -> group_median_output_dir={metric_output}")
+        run_global_median(
             input_csv=input_csv,
             output_dir=metric_output,
+            metric_col=metric,
+            group_cols=global_group_cols,
+            node_col=args.node_col,
+            time_col=time_col,
+            method=args.method,
+            min_t=int(args.min_t),
+            min_nodes=int(args.min_nodes),
+            min_subjects=int(args.min_subjects),
+            nbf=int(args.nbf),
+            delta=delta,
+            align_method=args.align_method,
+            max_runs=args.max_runs,
+        )
+
+        individual_output = output_base / "individual" / metric
+        print(f"[mdmp] metric={metric} -> individual_output_dir={individual_output}")
+        run(
+            input_csv=input_csv,
+            output_dir=individual_output,
             metric_col=metric,
             group_cols=group_cols,
             node_col=args.node_col,

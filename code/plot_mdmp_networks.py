@@ -1,4 +1,4 @@
-"""Plot directed MDMP networks for individual runs and group-level summaries.
+"""Plot directed MDMP networks from MDMP CSV outputs.
 
 Reads one or more MDMP output directories containing:
   - mdmp_edges_long.csv
@@ -6,8 +6,8 @@ Reads one or more MDMP output directories containing:
 
 Writes:
   results/plots/mdmp_networks/
+    groups/<metric>/<band>/*.png
     individual/<metric>/<band>/*.png
-    group/<metric>/<band>/*.png
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import argparse
 import math
 import os
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
 
@@ -32,12 +33,11 @@ from matplotlib.colors import Normalize
 from matplotlib.patches import FancyArrowPatch
 
 import config
+from calc_mdmp import VALID_METRICS, parse_metrics
 
 
 DEFAULT_INPUT_CANDIDATES = (
     config.RESULTS_DIR / "mdmp",
-    config.RESULTS_DIR / "mdmp_rel",
-    config.RESULTS_DIR / "mdmp_abs",
 )
 
 SUBJECT_TO_GROUP = {
@@ -53,18 +53,42 @@ BANDS_ORDER = list(getattr(config, "BANDS_ORDER", []))
 METRIC_ORDER = ["power_rel", "power_abs"]
 
 ROI_POSITIONS = {
-    "Prefrontal": (0.0, 1.00),
-    "Frontal": (0.55, 0.70),
-    "Frontocentral": (0.55, 0.25),
-    "Central": (0.0, 0.10),
+    "Prefrontal":       ( 0.00,  1.00),
+    "Frontal":          ( 0.55,  0.70),
+    "Frontocentral":    ( 0.55,  0.25),
+    "Central":          ( 0.00,  0.10),
     "Temporo-parietal": (-0.95, -0.05),
-    "Centro-parietal": (0.0, -0.30),
-    "Parietal": (-0.55, -0.62),
-    "Occipital": (0.0, -1.00),
+    "Centro-parietal":  ( 0.00, -0.30),
+    "Parietal":         (-0.55, -0.62),
+    "Occipital":        ( 0.00, -1.00),
 }
 
+ROI_ABBREV: Dict[str, str] = {
+    "Prefrontal":       "PFr",
+    "Frontal":          "Fr",
+    "Frontocentral":    "FCe",
+    "Central":          "Ce",
+    "Temporo-parietal": "TP",
+    "Centro-parietal":  "CP",
+    "Parietal":         "Pa",
+    "Occipital":        "Oc",
+}
+
+
+def _abbrev(node: str) -> str:
+    return ROI_ABBREV.get(node, node[:3])
+
 CONTEXT_COLS = ("metric", "method", "subject", "group", "session", "visual_state", "band")
-GROUP_CONTEXT_COLS = ("metric", "method", "group", "session", "visual_state", "band")
+GLOBAL_CONTEXT_COLS = (
+    "metric",
+    "method",
+    "vts_method",
+    "align_method",
+    "group",
+    "session",
+    "visual_state",
+    "band",
+)
 RUN_ID_COLS = ("subject", "session", "visual_state", "band", "metric", "method")
 
 
@@ -118,14 +142,28 @@ def slugify(value: object) -> str:
 
 def resolve_input_dirs(raw: str) -> List[Path]:
     if raw:
-        return [Path(p).expanduser().resolve() for p in parse_csv_list(raw)]
+        candidates = [Path(p).expanduser().resolve() for p in parse_csv_list(raw)]
+    else:
+        candidates = [path.resolve() for path in DEFAULT_INPUT_CANDIDATES]
 
     found = []
-    for candidate in DEFAULT_INPUT_CANDIDATES:
-        edges = candidate / "mdmp_edges_long.csv"
-        delta = candidate / "mdmp_delta_by_node.csv"
-        if edges.exists() and delta.exists():
-            found.append(candidate.resolve())
+    seen = set()
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+
+        search_dirs = [candidate]
+        if candidate.is_dir():
+            search_dirs.extend(sorted(path for path in candidate.rglob("*") if path.is_dir()))
+
+        for directory in search_dirs:
+            edges = directory / "mdmp_edges_long.csv"
+            delta = directory / "mdmp_delta_by_node.csv"
+            if edges.exists() and delta.exists():
+                resolved = directory.resolve()
+                if resolved not in seen:
+                    found.append(resolved)
+                    seen.add(resolved)
     return found
 
 
@@ -248,6 +286,23 @@ def filter_by_context(df: pd.DataFrame, context: Mapping[str, object]) -> pd.Dat
     return df.loc[mask].copy()
 
 
+def valid_subject_mask(df: pd.DataFrame) -> pd.Series:
+    if "subject" not in df.columns:
+        return pd.Series(False, index=df.index)
+    subjects = df["subject"].astype(str).str.strip()
+    return subjects.notna() & ~subjects.isin({"", "NA", "nan", "None"})
+
+
+def median_context_mask(df: pd.DataFrame) -> pd.Series:
+    markers = [col for col in ("vts_method", "align_method", "n_subjects") if col in df.columns]
+    if markers:
+        mask = pd.Series(False, index=df.index)
+        for col in markers:
+            mask |= df[col].notna()
+        return mask
+    return ~valid_subject_mask(df)
+
+
 def build_positions(nodes: Sequence[str]) -> Dict[str, Tuple[float, float]]:
     positions: Dict[str, Tuple[float, float]] = {}
     for node in nodes:
@@ -264,12 +319,113 @@ def build_positions(nodes: Sequence[str]) -> Dict[str, Tuple[float, float]]:
     return positions
 
 
+def _spread_curvatures(
+    edge_rows: List[Tuple[str, str, float]],
+    positions: Dict[str, Tuple[float, float]],
+    default_rad: float = 0.25,
+    min_sep: float = 0.16,
+    bidir_rad: float = 0.38,
+) -> Dict[Tuple[str, str], float]:
+    """Assign a unique arc3 curvature to every edge so no two arcs visually overlap.
+
+    Bidirectional pairs always get opposite signs with large separation.
+    Unidirectional edges leaving the same source are sorted by destination
+    angle and spread into a fan with guaranteed minimum curvature separation.
+    Every edge gets a non-zero curvature so no arc is a straight line.
+    """
+    edge_set = {(s, d) for s, d, _ in edge_rows}
+    curvatures: Dict[Tuple[str, str], float] = {}
+
+    # Bidirectional pairs: large, strictly opposite curvature
+    for src, dst, _ in edge_rows:
+        if (dst, src) in edge_set and (src, dst) not in curvatures:
+            sign = 1 if src < dst else -1
+            curvatures[(src, dst)] =  sign * bidir_rad
+            curvatures[(dst, src)] = -sign * bidir_rad
+
+    # Unidirectional edges: group by source, sort by angle to destination
+    by_src: Dict[str, list] = defaultdict(list)
+    for src, dst, _ in edge_rows:
+        if (src, dst) not in curvatures:
+            sx, sy = positions[src]
+            dx, dy = positions[dst]
+            angle = math.atan2(dy - sy, dx - sx)
+            by_src[src].append((angle, src, dst))
+
+    for src, items in by_src.items():
+        items_sorted = sorted(items)
+        n = len(items_sorted)
+        if n == 1:
+            _, s, d = items_sorted[0]
+            curvatures[(s, d)] = default_rad
+        else:
+            half = max(min_sep * (n - 1) / 2, 0.20)
+            half = min(half, 0.55)
+            rads = list(np.linspace(-half, half, n))
+            # Ensure no curvature is near zero
+            rads = [
+                math.copysign(max(abs(r), 0.12), r if r != 0.0 else 1.0)
+                for r in rads
+            ]
+            for (_, s, d), r in zip(items_sorted, rads):
+                curvatures[(s, d)] = r
+
+    return curvatures
+
+
+def _shrink(size_pts2: float, mutation_scale: float) -> float:
+    """Shrink in typographic points that clears the node circle and arrowhead."""
+    return math.sqrt(size_pts2 / math.pi) + mutation_scale * 0.55 + 4
+
+
+def _draw_legend(
+    ax: plt.Axes,
+    fig: plt.Figure,
+    cbar,
+    nodes: list,
+    in_str: dict,
+    out_str: dict,
+    weighted: bool,
+) -> None:
+    """Draw node in/out legend and strength table aligned to the colorbar bottom."""
+    header = f"{'node':<6}  {'in':>5}  {'out':>5}"
+    sep    = "-" * len(header)
+    rows   = [
+        f"{_abbrev(n):<6}  {format_strength(in_str[n], weighted):>5}  {format_strength(out_str[n], weighted):>5}"
+        for n in nodes
+    ]
+    text = "\n".join([header, sep] + rows)
+
+    fig.canvas.draw()
+    ax_pos   = ax.get_position()
+    cbar_pos = cbar.ax.get_position()
+
+    legend_x = ax_pos.x1 + 0.06
+    legend_y = cbar_pos.y0 - 0.077
+
+    fig.text(
+        legend_x, legend_y, text,
+        transform=fig.transFigure,
+        fontsize=7.5, family="monospace", color="black",
+        va="bottom", ha="right", multialignment="left",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
+                  edgecolor="#aaaaaa", linewidth=0.8, alpha=0.93),
+        zorder=10,
+    )
+
+
 def format_strength(value: float, weighted: bool) -> str:
     if weighted:
         return f"{value:.2f}"
     if abs(value - round(value)) < 1e-9:
         return str(int(round(value)))
     return f"{value:.2f}"
+
+
+def footer_legend_text(weighted: bool) -> str:
+    in_label = "incoming strength" if weighted else "incoming links"
+    out_label = "outgoing strength" if weighted else "outgoing links"
+    return f"node = ROI; in = {in_label}; out = {out_label}"
 
 
 def draw_network(
@@ -312,38 +468,29 @@ def draw_network(
     max_strength = max(total_strength.values()) if total_strength else 1.0
     max_strength = max(max_strength, 1e-9)
 
-    node_sizes = [900.0 + 1800.0 * (total_strength[node] / max_strength) for node in nodes]
+    node_sizes = {node: 900.0 + 1800.0 * (total_strength[node] / max_strength) for node in nodes}
     node_values = [float(node_dfhat.get(node, np.nan)) for node in nodes]
     node_values = [0.5 if np.isnan(v) else float(v) for v in node_values]
 
-    # Per-node shrink radius (points) = sqrt(area/π) + padding
-    node_shrink = {
-        node: math.sqrt(node_sizes[i] / math.pi) + 4
-        for i, node in enumerate(nodes)
-    }
-
     fig, ax = plt.subplots(figsize=(12.8, 9.2))
-    ax.set_facecolor("#f4f6f8")
+    ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
 
-    edge_pairs = {(str(r.parent), str(r.child)) for r in edges_df.itertuples(index=False)}
-    for row in edges_df.itertuples(index=False):
-        parent = str(row.parent)
-        child = str(row.child)
-        weight = float(row.weight)
-        if parent == child:
-            continue
-        if parent not in positions or child not in positions:
-            continue
+    edge_rows = [
+        (str(r.parent), str(r.child), float(r.weight))
+        for r in edges_df.itertuples(index=False)
+        if str(r.parent) != str(r.child)
+        and str(r.parent) in positions
+        and str(r.child) in positions
+    ]
+    curvatures = _spread_curvatures(edge_rows, positions)
+    max_w = max((w for _, _, w in edge_rows), default=1.0) or 1.0
 
-        has_reverse = (child, parent) in edge_pairs
-        if has_reverse:
-            rad = 0.25 if parent < child else -0.25
-        else:
-            rad = 0.03
-
-        intensity = min(max(weight, 0.0), 1.0)
+    for parent, child, weight in edge_rows:
+        intensity = min(max(weight / max_w, 0.0), 1.0)
         linewidth = float(edge_width_min) + (float(edge_width_max) - float(edge_width_min)) * intensity
         mutation_scale = float(arrow_size_min) + (float(arrow_size_max) - float(arrow_size_min)) * intensity
+        rad = curvatures.get((parent, child), 0.25)
 
         arrow = FancyArrowPatch(
             positions[parent],
@@ -354,9 +501,9 @@ def draw_network(
             linewidth=linewidth,
             color=edge_color,
             alpha=float(edge_alpha),
-            shrinkA=node_shrink.get(parent, 18),
-            shrinkB=node_shrink.get(child, 18),
-            zorder=1,
+            shrinkA=0,
+            shrinkB=_shrink(node_sizes[child], mutation_scale),
+            zorder=2,
         )
         ax.add_patch(arrow)
 
@@ -367,7 +514,7 @@ def draw_network(
     ax.scatter(
         xy[:, 0],
         xy[:, 1],
-        s=node_sizes,
+        s=[node_sizes[n] for n in nodes],
         c=node_values,
         cmap=node_cmap,
         norm=node_norm,
@@ -378,35 +525,22 @@ def draw_network(
 
     for node in nodes:
         x, y = positions[node]
-        in_txt = format_strength(in_strength.get(node, 0.0), weighted=weighted)
-        out_txt = format_strength(out_strength.get(node, 0.0), weighted=weighted)
-        ax.text(
-            x,
-            y,
-            f"{node}\n(in={in_txt}, out={out_txt})",
-            ha="center",
-            va="center",
-            fontsize=8.5,
-            color="#111827",
-            zorder=4,
-        )
+        ax.text(x, y, _abbrev(node), ha="center", va="center",
+                fontsize=9, fontweight="bold", color="black", zorder=4)
 
     scalar = ScalarMappable(norm=node_norm, cmap=node_cmap)
     scalar.set_array([])
     cbar = fig.colorbar(scalar, ax=ax, shrink=0.85, pad=0.02)
-    cbar.set_label("df_hat")
+    cbar.set_label("df_hat", color="black")
+    cbar.ax.yaxis.set_tick_params(color="black")
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="black")
 
-    ax.set_title(title, fontsize=13.5, pad=16)
-    ax.text(
-        0.01,
-        0.02,
-        subtitle,
-        transform=ax.transAxes,
-        fontsize=9,
-        color="#374151",
-        ha="left",
-        va="bottom",
-    )
+    _draw_legend(ax, fig, cbar, nodes, in_strength, out_strength, weighted)
+
+    ax.set_title(title, fontsize=13.5, pad=16, color="black")
+    footer = f"{subtitle}\n{footer_legend_text(weighted)}"
+    ax.text(0.01, 0.02, footer, transform=ax.transAxes,
+            fontsize=9, color="black", ha="left", va="bottom")
 
     min_x, max_x = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
     min_y, max_y = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
@@ -449,10 +583,34 @@ def plot_individual_networks(
         values = key if isinstance(key, tuple) else (key,)
         context = {col: val for col, val in zip(key_cols, values)}
 
-        run_edges = run_edges_raw[["parent", "child"]].dropna().drop_duplicates().copy()
+        value_cols = [col for col in ("median_coef", "abs_median_coef") if col in run_edges_raw.columns]
+        run_edges = (
+            run_edges_raw[["parent", "child", *value_cols]]
+            .dropna(subset=["parent", "child"])
+            .drop_duplicates()
+            .copy()
+        )
         if run_edges.empty:
             continue
-        run_edges["weight"] = 1.0
+        if "abs_median_coef" in run_edges.columns:
+            run_edges["weight_raw"] = pd.to_numeric(run_edges["abs_median_coef"], errors="coerce")
+        elif "median_coef" in run_edges.columns:
+            run_edges["weight_raw"] = pd.to_numeric(run_edges["median_coef"], errors="coerce").abs()
+        else:
+            run_edges["weight_raw"] = np.nan
+
+        max_weight = float(run_edges["weight_raw"].max(skipna=True))
+        if not np.isfinite(max_weight) or max_weight <= 0.0:
+            run_edges["weight"] = 1.0
+            weighted = False
+            subtitle = "Edge weight = 1 (edge present in this subject/run)."
+        else:
+            run_edges["weight"] = run_edges["weight_raw"].fillna(0.0) / max_weight
+            weighted = True
+            subtitle = (
+                "Edge weight = normalized absolute median of the smoothed dynamic "
+                "coefficient for this subject/run."
+            )
 
         run_delta = filter_by_context(delta, context)
         node_dfhat = (
@@ -482,7 +640,6 @@ def plot_individual_networks(
             "MDMP individual network | "
             f"sub-{subject} | {group} | {session} | {state} | {band} | {metric} ({method})"
         )
-        subtitle = "Edge weight = 1 (edge present in this subject/run)."
         filename = (
             f"mdmp_sub-{slugify(subject)}_{slugify(group)}_{slugify(session)}_"
             f"{slugify(state)}_{slugify(band)}_{slugify(metric)}_{slugify(method)}.png"
@@ -494,7 +651,7 @@ def plot_individual_networks(
             title=title,
             subtitle=subtitle,
             out_path=out_path,
-            weighted=False,
+            weighted=weighted,
             dpi=dpi,
             edge_color=edge_color,
             edge_alpha=edge_alpha,
@@ -508,12 +665,10 @@ def plot_individual_networks(
     return count
 
 
-def plot_group_networks(
+def plot_global_networks(
     edges: pd.DataFrame,
     delta: pd.DataFrame,
     out_dir: Path,
-    min_edge_freq: float,
-    max_edges: int,
     dpi: int,
     edge_color: str,
     edge_alpha: float,
@@ -522,47 +677,50 @@ def plot_group_networks(
     arrow_size_min: float,
     arrow_size_max: float,
 ) -> int:
-    if "group" not in edges.columns:
-        print("[plot-mdmp] skip group: 'group' column not found.")
+    key_cols = [col for col in GLOBAL_CONTEXT_COLS if col in edges.columns]
+    if not key_cols:
+        print("[plot-mdmp] skip global: no global context columns found.")
         return 0
 
-    key_cols = [col for col in GROUP_CONTEXT_COLS if col in edges.columns]
-    run_cols = [col for col in RUN_ID_COLS if col in edges.columns]
     count = 0
-
     grouped = edges.groupby(key_cols, dropna=False, sort=True, observed=True)
-    for key, block in grouped:
+    for key, run_edges_raw in grouped:
         values = key if isinstance(key, tuple) else (key,)
         context = {col: val for col, val in zip(key_cols, values)}
 
-        if run_cols:
-            n_runs = int(block[run_cols].drop_duplicates().shape[0])
-        else:
-            n_runs = 1
-        n_runs = max(n_runs, 1)
-
-        keep_cols = ["parent", "child"] + run_cols
-        edge_presence = block[keep_cols].dropna(subset=["parent", "child"]).drop_duplicates()
-        edge_counts = (
-            edge_presence.groupby(["parent", "child"], as_index=False)
-            .size()
-            .rename(columns={"size": "count"})
+        value_cols = [col for col in ("median_coef", "abs_median_coef") if col in run_edges_raw.columns]
+        run_edges = (
+            run_edges_raw[["parent", "child", *value_cols]]
+            .dropna(subset=["parent", "child"])
+            .drop_duplicates()
+            .copy()
         )
-        if edge_counts.empty:
+        if run_edges.empty:
             continue
-        edge_counts["weight"] = edge_counts["count"] / float(n_runs)
-        edge_counts = edge_counts.sort_values("weight", ascending=False).reset_index(drop=True)
+        if "abs_median_coef" in run_edges.columns:
+            run_edges["weight_raw"] = pd.to_numeric(run_edges["abs_median_coef"], errors="coerce")
+        elif "median_coef" in run_edges.columns:
+            run_edges["weight_raw"] = pd.to_numeric(run_edges["median_coef"], errors="coerce").abs()
+        else:
+            run_edges["weight_raw"] = np.nan
 
-        selected = edge_counts.loc[edge_counts["weight"] >= float(min_edge_freq)].copy()
-        if selected.empty:
-            selected = edge_counts.head(min(len(edge_counts), int(max_edges))).copy()
-        if len(selected) > int(max_edges):
-            selected = selected.head(int(max_edges)).copy()
+        max_weight = float(run_edges["weight_raw"].max(skipna=True))
+        if not np.isfinite(max_weight) or max_weight <= 0.0:
+            run_edges["weight"] = 1.0
+            weighted = False
+            subtitle = "Edge weight = 1 (edge present in median VTS network)."
+        else:
+            run_edges["weight"] = run_edges["weight_raw"].fillna(0.0) / max_weight
+            weighted = True
+            subtitle = (
+                "Structure recalculated on median VTS; edge width = normalized "
+                "|median smoothed coefficient|."
+            )
 
-        group_delta = filter_by_context(delta, context)
+        run_delta = filter_by_context(delta, context)
         node_dfhat = (
-            group_delta.groupby("node", as_index=False)["df_hat"].mean()
-            if not group_delta.empty
+            run_delta.groupby("node", as_index=False)["df_hat"].mean()
+            if not run_delta.empty
             else pd.DataFrame(columns=["node", "df_hat"])
         )
         node_map = {
@@ -571,33 +729,37 @@ def plot_group_networks(
             if pd.notna(row.df_hat)
         }
 
+        n_subjects = "NA"
+        if "n_subjects" in run_edges_raw.columns:
+            n_values = run_edges_raw["n_subjects"].dropna()
+            if not n_values.empty:
+                n_subjects = str(int(float(n_values.iloc[0])))
+        if n_subjects != "NA":
+            subtitle = f"{subtitle} n={n_subjects} subjects."
+
         metric = context.get("metric", "unknown")
-        group = context.get("group", "Unknown")
         session = context.get("session", "NA")
         state = context.get("visual_state", "NA")
         band = context.get("band", "NA")
         method = context.get("method", "mdmp")
+        group = context.get("group", "Unknown")
 
         title = (
-            "MDMP group network | "
+            "MDMP global median network | "
             f"{group} | {session} | {state} | {band} | {metric} ({method})"
         )
-        subtitle = (
-            f"Edge weight = frequency across subjects/runs (n={n_runs}); "
-            f"plot threshold >= {float(min_edge_freq):.2f}."
-        )
         filename = (
-            f"mdmp_group-{slugify(group)}_{slugify(session)}_{slugify(state)}_"
+            f"mdmp_median_{slugify(group)}_{slugify(session)}_{slugify(state)}_"
             f"{slugify(band)}_{slugify(metric)}_{slugify(method)}.png"
         )
-        out_path = out_dir / "group" / slugify(metric) / slugify(band) / filename
+        out_path = out_dir / "groups" / slugify(metric) / slugify(band) / filename
         draw_network(
-            edges_df=selected[["parent", "child", "weight"]],
+            edges_df=run_edges[["parent", "child", "weight"]],
             node_dfhat=node_map,
             title=title,
             subtitle=subtitle,
             out_path=out_path,
-            weighted=True,
+            weighted=weighted,
             dpi=dpi,
             edge_color=edge_color,
             edge_alpha=edge_alpha,
@@ -614,8 +776,7 @@ def plot_group_networks(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot MDMP directed networks (individual + group) from mdmp_edges_long.csv "
-            "and mdmp_delta_by_node.csv."
+            "Plot MDMP directed networks from CSVs generated by code/calc_mdmp.py."
         )
     )
     parser.add_argument(
@@ -624,15 +785,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated MDMP directories. Each must contain mdmp_edges_long.csv "
-            "and mdmp_delta_by_node.csv. If omitted, auto-detects results/mdmp, "
-            "results/mdmp_rel, results/mdmp_abs."
+            "and mdmp_delta_by_node.csv. If omitted, auto-detects results/mdmp "
+            "recursively, including results/mdmp/power_rel and "
+            "results/mdmp/individual/power_rel."
         ),
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
         default=config.PLOTS_DIR / "mdmp_networks",
-        help="Output directory for network figures.",
+        help="Output directory for individual network figures.",
     )
     _default_metrics = ",".join(config.MDMP_METRICS_TO_RUN)
     parser.add_argument(
@@ -642,19 +804,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Comma-separated metrics to plot (default: {_default_metrics}).",
     )
     parser.add_argument(
-        "--min-group-edge-freq",
-        type=float,
-        default=0.30,
-        help=(
-            "Minimum edge frequency for group plots (0-1). "
-            "If no edge survives, top edges are kept."
-        ),
+        "--metric",
+        choices=VALID_METRICS,
+        default=getattr(config, "MDMP_METRIC", "power_rel"),
+        help="Single metric fallback used when --metrics is empty.",
     )
     parser.add_argument(
-        "--max-group-edges",
-        type=int,
-        default=24,
-        help="Maximum number of edges per group-level graph.",
+        "--skip-individual",
+        action="store_true",
+        help="Skip individual networks from mdmp_edges_long.csv.",
     )
     parser.add_argument(
         "--dpi",
@@ -704,25 +862,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_arg_parser().parse_args()
 
+    metrics = parse_metrics(raw_metrics=args.metrics, fallback_metric=args.metric)
     input_dirs = resolve_input_dirs(args.input_dirs)
     if not input_dirs:
         raise FileNotFoundError(
             "No input directories found. Pass --input-dirs with directories that contain "
-            "mdmp_edges_long.csv and mdmp_delta_by_node.csv."
+            "mdmp_edges_long.csv and mdmp_delta_by_node.csv, or run code/calc_mdmp.py first."
         )
 
     edges, delta = load_mdmp_tables(input_dirs)
     edges, delta = clean_table_columns(edges, delta)
-
-    requested_metrics = parse_csv_list(args.metrics)
-    if requested_metrics:
-        edges = edges[edges["metric"].isin(requested_metrics)].copy()
-        delta = delta[delta["metric"].isin(requested_metrics)].copy()
+    edges = edges[edges["metric"].isin(metrics)].copy()
+    delta = delta[delta["metric"].isin(metrics)].copy()
 
     if edges.empty:
-        raise ValueError(
-            "No rows left after metric filtering. Check --metrics and MDMP source CSVs."
-        )
+        raise ValueError("No rows left after metric filtering. Check --metrics and MDMP CSVs.")
 
     edges = sort_for_reporting(edges)
     delta = sort_for_reporting(delta)
@@ -733,35 +887,45 @@ def main() -> int:
     available_metrics = sorted(edges["metric"].dropna().astype(str).unique().tolist())
     print(f"[plot-mdmp] metrics in scope: {available_metrics}")
 
-    individual_n = plot_individual_networks(
-        edges=edges,
-        delta=delta,
-        out_dir=out_dir,
-        dpi=int(args.dpi),
-        edge_color=str(args.edge_color),
-        edge_alpha=float(args.edge_alpha),
-        edge_width_min=float(args.edge_width_min),
-        edge_width_max=float(args.edge_width_max),
-        arrow_size_min=float(args.arrow_size_min),
-        arrow_size_max=float(args.arrow_size_max),
-    )
-    group_n = plot_group_networks(
-        edges=edges,
-        delta=delta,
-        out_dir=out_dir,
-        min_edge_freq=float(args.min_group_edge_freq),
-        max_edges=int(args.max_group_edges),
-        dpi=int(args.dpi),
-        edge_color=str(args.edge_color),
-        edge_alpha=float(args.edge_alpha),
-        edge_width_min=float(args.edge_width_min),
-        edge_width_max=float(args.edge_width_max),
-        arrow_size_min=float(args.arrow_size_min),
-        arrow_size_max=float(args.arrow_size_max),
-    )
+    individual_edge_mask = valid_subject_mask(edges)
+    individual_delta_mask = valid_subject_mask(delta)
+    global_edge_mask = median_context_mask(edges)
+    global_delta_mask = median_context_mask(delta)
+    has_subject_rows = bool(individual_edge_mask.any())
+    has_global_rows = bool(global_edge_mask.any())
+    individual_n = 0
+    global_n = 0
+
+    if has_subject_rows and not args.skip_individual:
+        individual_n = plot_individual_networks(
+            edges=edges.loc[individual_edge_mask].copy(),
+            delta=delta.loc[individual_delta_mask].copy(),
+            out_dir=out_dir,
+            dpi=int(args.dpi),
+            edge_color=str(args.edge_color),
+            edge_alpha=float(args.edge_alpha),
+            edge_width_min=float(args.edge_width_min),
+            edge_width_max=float(args.edge_width_max),
+            arrow_size_min=float(args.arrow_size_min),
+            arrow_size_max=float(args.arrow_size_max),
+        )
+
+    if has_global_rows:
+        global_n = plot_global_networks(
+            edges=edges.loc[global_edge_mask].copy(),
+            delta=delta.loc[global_delta_mask].copy(),
+            out_dir=out_dir,
+            dpi=int(args.dpi),
+            edge_color=str(args.edge_color),
+            edge_alpha=float(args.edge_alpha),
+            edge_width_min=float(args.edge_width_min),
+            edge_width_max=float(args.edge_width_max),
+            arrow_size_min=float(args.arrow_size_min),
+            arrow_size_max=float(args.arrow_size_max),
+        )
 
     print(f"[plot-mdmp] individual plots: {individual_n}")
-    print(f"[plot-mdmp] group plots: {group_n}")
+    print(f"[plot-mdmp] global plots: {global_n}")
     print(f"[plot-mdmp] output root: {out_dir}")
     return 0
 
